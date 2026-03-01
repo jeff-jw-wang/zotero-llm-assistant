@@ -356,13 +356,23 @@ and must handle "no library access" differently:
 `ℹ gpt-4o-mini · api.openai.com · non-stream · 4,231 tokens`
 This makes debugging fast without cluttering the main UI.
 
+**Diagnostics redaction rules** (enforced in the formatter, not left to callers):
+- Endpoint URL: strip query parameters entirely before display
+  (`?key=AIza…` → omit; show host + path only: `generativelanguage.googleapis.com`)
+- API key: never included in the footer under any circumstances
+- Request headers: never logged or displayed
+- The formatter function must own redaction — no caller should need to pre-sanitize
+
 **Release gate for v0.1.1a**:
 - [ ] Semantic search download completes from Settings pane without error
 - [ ] Ollama responds to a question about an open PDF
 - [ ] OpenAI/Anthropic respond — zero error messages shown to user
 - [ ] Free Gemini API does not hit quota on a 30-page PDF
-- [ ] Diagnostics footer shows correct provider, endpoint, and mode
+- [ ] Diagnostics footer shows correct provider, endpoint, and mode; no key/param leakage
 - [ ] `npm run build` passes with zero type errors
+- [ ] **Quantitative**: each provider passes ≥ 9/10 manual send attempts without
+  timeout or error message shown to user (test over 10 consecutive sends on a
+  20-page PDF; record pass/fail per attempt; merge only if all providers ≥ 90%)
 
 **Rollback criteria**: If any P0 check fails after merge to `develop`, revert the
 specific commit (not the whole branch) and re-open the issue.
