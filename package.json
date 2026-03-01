@@ -1,0 +1,39 @@
+{
+  "name": "zotero-llm-assistant",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "AI-powered research assistant for Zotero — chat with papers, search your library, and jump to cited pages.",
+  "config": {
+    "addonName": "Zotero LLM Assistant",
+    "addonID": "zotero-llm-assistant@github.com",
+    "addonRef": "zotero-llm-assistant",
+    "addonInstance": "ZoteroLLMAssistant",
+    "prefsPrefix": "extensions.zotero.zotero-llm-assistant"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeff-jw-wang/zotero-llm-assistant.git"
+  },
+  "author": "Jeff Wang",
+  "homepage": "https://github.com/jeff-jw-wang/zotero-llm-assistant",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "start": "zotero-plugin serve",
+    "build": "zotero-plugin build && tsc --noEmit",
+    "test:chunker": "tsx test/chunker.test.ts",
+    "test:phase-c": "tsx test/phase-c.test.ts",
+    "test:phase-d": "tsx test/phase-d.test.ts",
+    "release": "zotero-plugin release"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
+    "zotero-plugin-toolkit": "^5.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "zotero-plugin-scaffold": "^0.8.2",
+    "zotero-types": "^4.1.0-beta.4"
+  }
+}
