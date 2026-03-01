@@ -224,24 +224,46 @@ Anthropic:          50,000 tokens
 Reduce `topK` dynamically to fit within budget.
 
 **Fix — adaptive context management** (v0.2.0):
-Rather than "send paper once", use a **rolling context** strategy:
-- First message: run full RAG, cache the selected chunk set in session state.
-- Follow-up messages: reuse cached chunks if the question is topically related
-  (cosine similarity of question embedding vs. session centroid > threshold).
-  If the topic shifts significantly, re-run RAG for the new question.
-- After 4+ turns: generate a rolling summary of earlier turns and compress
-  conversation history to stay within token budget.
-- Expose a "New Topic" button to force a RAG reset.
+Use a **rolling context** strategy with strict guardrails against grounding degradation:
+- First message: run full RAG, cache the selected chunk set and compute a session
+  centroid embedding from the selected chunks.
+- Follow-up messages: reuse cached chunks **only if** all three conditions hold:
+  1. Cosine similarity of new question embedding vs. session centroid ≥ 0.72
+  2. Question does not contain explicit location/citation keywords
+     ("where", "page", "section", "figure", "table", "cite", "reference", "according to")
+  3. Fewer than 6 turns since last RAG run
+  If any condition fails → re-run full RAG for the new question.
+- After 4+ turns: generate a rolling summary of the oldest 2 turns to compress history.
+  Keep the 2 most recent turns verbatim; summarize the rest.
+- Expose a "New Topic" button to force an unconditional RAG reset.
 
-This preserves QA accuracy while drastically reducing API cost for multi-turn conversations.
+Hard rule: **always prefer false negatives over false positives** on the reuse decision.
+When in doubt, re-run RAG. The cost of a missed context is worse than a redundant retrieval.
 
 ---
 
 ### #12 — Imprecise citations
-**Root cause**: Chunks store `pageNumber` but not character offsets within the page.
-`Zotero.Reader` supports navigation to `{ pageIndex, position: { rects } }`.
-**Fix** (v0.3.0): Record `charStart`/`charEnd` per chunk during extraction.
-Pass to reader via `reader.navigate({ pageIndex, charRange })`.
+**Root cause**: Chunks store `pageNumber` but not sub-page location.
+
+**What is and isn't achievable**:
+- `Zotero.FullText.getItemContent()` returns raw text with form-feed page breaks.
+  It does **not** expose PDF geometry (bounding boxes, line positions, rects).
+- `Zotero.Reader` accepts `{ pageIndex, position: { rects } }` for rect-based
+  navigation, but rects require PDF geometry data we do not have from the text extractor.
+- Sentence-accurate navigation is therefore **not achievable** without a full PDF
+  geometry pipeline (PDF.js position mapping), which is out of scope until v0.4.0+.
+
+**Best-effort fix** (v0.3.0):
+- Record approximate character offset (`charStart`) per chunk within the page's
+  raw text string during extraction.
+- On citation click: navigate to the correct page (`pageIndex`) and pass a
+  text search hint (first 60 chars of chunk) to `reader.navigate()` using
+  Zotero's find/highlight API if available, or scroll to page as fallback.
+- Label citations in the UI as "~page N" to set correct user expectations.
+  Do not imply sentence-level accuracy.
+
+Guaranteed: correct page. Best-effort: approximate paragraph highlight.
+Sentence-accurate rect navigation deferred to v0.4.0+ pending PDF geometry work.
 
 ---
 
@@ -259,13 +281,25 @@ It should not be the primary fix.
   called before Zotero's database is fully loaded.
 
 **Fix strategy** (v0.3.0):
-1. **Immediate UX**: Show "Library index unavailable — click to rebuild" in the
-   library panel when the index is empty. Never show a confusing LLM response
-   about not having access.
-2. **Proper fix**: Add startup delay + retry for initial scan. Use
-   `Zotero.Schema.schemaUpdatePromise` to wait for DB readiness before scanning.
+
+**Surface distinction** — reader chat and library chat are different UX surfaces
+and must handle "no library access" differently:
+- **Reader panel**: The LLM should never claim it "cannot access your library".
+  Instead, add an explicit action button **"Search my library for this topic"** which
+  triggers a library search for the current question and injects matching item
+  metadata into the next message context. The LLM has no ambient library access
+  by default — it only receives library context when the user explicitly requests it.
+- **Library panel**: Show a clear status badge: "Index ready (N items)" or
+  "Library index unavailable — [Rebuild]". The panel is disabled with a
+  descriptive message when the index is empty, rather than passing the empty
+  index to the LLM and letting it confabulate.
+
+1. **Immediate UX**: Status badge + "Rebuild Index" button in library panel header.
+   Disable the library chat input when index is empty (not zero results — truly empty).
+2. **Proper fix**: Wait for `Zotero.Schema.schemaUpdatePromise` before initial scan.
+   Force a full scan on first startup; use notifier for incremental updates thereafter.
 3. **Web API as optional enhancement** only (not fallback): let users optionally
-   enter a Zotero API key in settings to supplement local search with cloud sync.
+   enter a Zotero API key in settings to supplement local search with cloud-synced items.
 
 ---
 
@@ -304,25 +338,42 @@ It should not be the primary fix.
 
 ---
 
-### v0.1.1 — P0 Reliability + P2 UX Bundle
-**Branch**: `fix/v0.1.1` off `develop`
-**Scope**: Make the plugin reliably functional end-to-end
-**Estimated effort**: 2–3 days
+### v0.1.1a — P0 Reliability Only
+**Branch**: `fix/v0.1.1a` off `develop`
+**Scope**: Three P0 crashes + free-tier quota blocker. No UX changes.
+**Estimated effort**: 1–2 days
 
-#### P0 Reliability
 | Task | File(s) | Issue |
 |------|---------|-------|
-| Fix Transformers.js runtime: set `env` flags, call only from main window | `embedder.ts`, `hooks.ts`, `settingsPane.ts` | #1 |
+| Fix Transformers.js runtime: set `env` flags before pipeline; call `ensureModelReady()` only from main window | `embedder.ts`, `hooks.ts`, `settingsPane.ts` | #1 |
 | Move Ollama `chat()` + `isAvailable()` to `httpPost/httpGet` | `ollama.ts` | #3 |
-| Add XHR `onprogress` streaming for Ollama | `ollama.ts` | #3 |
-| Silent streaming fallback — never show "streaming failed" to user | `readerPanel.ts` | #2 |
+| Add XHR `onprogress` streaming for Ollama NDJSON | `ollama.ts` | #3 |
+| Silent streaming fallback — replace "streaming failed" with neutral "Thinking…" | `readerPanel.ts` | #2 |
+| Per-provider `maxContextTokens` + dynamic topK cap | `pipeline.ts`, `prefs.ts` | #10 |
+| Provider diagnostics note in chat footer (provider · endpoint · mode) | `readerPanel.ts` | — |
 
-#### P1 Cost Fix (unblock free-tier users)
-| Task | File(s) | Issue |
-|------|---------|-------|
-| Per-provider `maxContextTokens` + dynamic topK reduction | `pipeline.ts`, `prefs.ts` | #10 |
+**Provider diagnostics**: After each response, show a small collapsed footer:
+`ℹ gpt-4o-mini · api.openai.com · non-stream · 4,231 tokens`
+This makes debugging fast without cluttering the main UI.
 
-#### P2 UX
+**Release gate for v0.1.1a**:
+- [ ] Semantic search download completes from Settings pane without error
+- [ ] Ollama responds to a question about an open PDF
+- [ ] OpenAI/Anthropic respond — zero error messages shown to user
+- [ ] Free Gemini API does not hit quota on a 30-page PDF
+- [ ] Diagnostics footer shows correct provider, endpoint, and mode
+- [ ] `npm run build` passes with zero type errors
+
+**Rollback criteria**: If any P0 check fails after merge to `develop`, revert the
+specific commit (not the whole branch) and re-open the issue.
+
+---
+
+### v0.1.1b — P2 UX Bundle
+**Branch**: `fix/v0.1.1b` off `develop` (requires v0.1.1a merged first)
+**Scope**: Input, copy, scroll edge cases. No new features.
+**Estimated effort**: 1 day
+
 | Task | File(s) | Issue |
 |------|---------|-------|
 | Guard `renderChatUI` against re-render wipe during active session | `readerPanel.ts` | #5 |
@@ -330,14 +381,12 @@ It should not be the primary fix.
 | Replace `<input>` with auto-grow `<textarea>` (Ctrl+Enter sends) | `readerPanel.ts` | #7 |
 | Enable `user-select: text` + per-message copy button | `readerPanel.ts` | #8 |
 
-**Test checklist**:
-- [ ] Semantic search download completes from Settings pane without crash
-- [ ] Ollama responds to a question about an open PDF
-- [ ] OpenAI responds without any error message shown to user
-- [ ] Free Gemini API does not hit quota on a 30-page PDF
-- [ ] Chat area maintains state when user switches tabs and back
-- [ ] Textarea wraps and expands; Ctrl+Enter sends
+**Release gate for v0.1.1b**:
+- [ ] Chat area maintains state when user switches tabs and returns
+- [ ] Textarea wraps and expands up to 5 rows; Ctrl+Enter sends; Enter adds newline
 - [ ] Can select and copy assistant response text
+- [ ] Scroll jumps to bottom after every message (including mid-stream tokens)
+- [ ] All v0.1.1a gate criteria still pass
 
 ---
 
@@ -359,19 +408,22 @@ It should not be the primary fix.
 
 ---
 
-### v0.3.0 — Library Integration + Precise Citations
+### v0.3.0 — Library Integration + Best-Effort Citations
 **Branch**: `feat/v0.3.0` off `develop`
-**Scope**: Real library access; citations jump to paragraph
+**Scope**: Working library access; citations jump to correct page with highlight attempt
 **Estimated effort**: 5–7 days
 
 | Task | File(s) | Issue |
 |------|---------|-------|
-| Wait for `Zotero.Schema.schemaUpdatePromise` before library scan | `indexer.ts` | #13 |
-| "Rebuild index" button + status indicator in library panel | `libraryPanel.ts` | #13 |
-| Paragraph-level citation: `charStart/charEnd` per chunk → `reader.navigate()` | `chunker.ts`, `extractor.ts`, `readerPanel.ts` | #12 |
+| Wait for `Zotero.Schema.schemaUpdatePromise` before initial library scan | `indexer.ts` | #13 |
+| Index status badge + "Rebuild Index" button in library panel | `libraryPanel.ts` | #13 |
+| Disable library chat input when index empty; show descriptive message | `libraryPanel.ts` | #13 |
+| "Search my library for this topic" action button in reader panel | `readerPanel.ts` | #13 |
+| Best-effort page+highlight citation: `charStart` hint → `reader.navigate()` page jump + text search | `chunker.ts`, `extractor.ts`, `readerPanel.ts` | #12 |
+| Label citations as "~page N" in UI (set correct user expectations) | `readerPanel.ts` | #12 |
 | Cross-paper reference detection + `Zotero.Reader.open()` | `searcher.ts`, `libraryPanel.ts` | #14 |
-| Markdown rendering in chat (bold, code, lists) | `readerPanel.ts` | — |
-| Zotero Web API as optional supplement (settings opt-in) | `library/api.ts` | #13 |
+| Markdown rendering in chat (bold, inline code, lists) | `readerPanel.ts` | — |
+| Zotero Web API as optional supplement (settings opt-in, not default) | `library/api.ts` | #13 |
 
 ---
 
