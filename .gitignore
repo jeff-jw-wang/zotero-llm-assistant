@@ -7,3 +7,4 @@ node_modules/
 PLAN*.md
 tsconfig.tsbuildinfo
 .github/workflows/
+CLAUDE.md
