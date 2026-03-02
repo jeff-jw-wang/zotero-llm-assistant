@@ -5,6 +5,7 @@ node_modules/
 .DS_Store
 .claude/
 PLAN*.md
+PROGRESS.md
 tsconfig.tsbuildinfo
 .github/workflows/
 CLAUDE.md
