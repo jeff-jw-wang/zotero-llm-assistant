@@ -5,8 +5,11 @@
  * This is the default provider when detected, as it requires no API key
  * and keeps all data local (no cloud sharing).
  *
- * Streaming uses the /api/chat endpoint with `stream: true`, which returns
- * newline-delimited JSON objects.
+ * Transport: non-stream calls use `httpPost()` (wraps Zotero.HTTP.request so
+ * they route correctly through system proxy and Zotero's network stack).
+ * Streaming uses direct XMLHttpRequest with `onprogress` for incremental
+ * NDJSON reading — the Fetch API's ReadableStream is unreliable in Zotero's
+ * privileged chrome context (Issue #3).
  *
  * @module modules/llm/providers/ollama
  * @see https://github.com/ollama/ollama/blob/main/docs/api.md
@@ -17,16 +20,17 @@ import type {
   ChatOptions,
   StreamChunk,
 } from "../types";
+import { httpPost, httpGet } from "../../../utils/http";
 
 const DEFAULT_ENDPOINT = "http://localhost:11434";
 
-/** Connection timeout (ms) for the initial fetch — prevents hanging if Ollama isn't running. */
+/** Connection timeout (ms) — fires if no response data arrives within this window. */
 const CONNECTION_TIMEOUT_MS = 15_000;
 
 /**
- * Idle-read timeout (ms) — if no data arrives during streaming for this long,
- * abort. Set higher than cloud providers because Ollama may take time to
- * load/warm a model before the first token arrives.
+ * Idle-read timeout (ms) — if no new data arrives during streaming for this long,
+ * abort. Higher than cloud providers because Ollama may need time to load/warm
+ * a model before the first token arrives.
  */
 const IDLE_READ_TIMEOUT_MS = 120_000;
 
@@ -40,11 +44,15 @@ export class OllamaProvider implements ILLMProvider {
     this.endpoint = (endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
   }
 
+  /**
+   * Sends a non-streaming chat request via Zotero.HTTP.request (XHR-based).
+   * Used directly when streaming is unavailable, and as the fallback when
+   * chatStream() fails.
+   */
   async chat(messages: LLMMessage[], options: ChatOptions): Promise<string> {
-    const response = await fetch(`${this.endpoint}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const response = await httpPost(
+      `${this.endpoint}/api/chat`,
+      JSON.stringify({
         model: options.model,
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         stream: false,
@@ -53,24 +61,233 @@ export class OllamaProvider implements ILLMProvider {
           ...(options.maxTokens != null && { num_predict: options.maxTokens }),
         },
       }),
-      signal: AbortSignal.timeout(CONNECTION_TIMEOUT_MS),
-    });
+      { "Content-Type": "application/json" },
+      CONNECTION_TIMEOUT_MS,
+    );
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Ollama error ${response.status}: ${text}`);
+      throw new Error(`Ollama error ${response.status}: ${response.text}`);
     }
 
-    const data = (await response.json()) as any;
+    const data = response.json() as any;
     return data.message?.content ?? "";
   }
 
+  /**
+   * Streams the chat response as an async generator of StreamChunk objects.
+   *
+   * Prefers XHR-based streaming (XMLHttpRequest + onprogress) which works
+   * reliably in Zotero's chrome context. Falls back to fetch()-based streaming
+   * for test environments where XMLHttpRequest is unavailable.
+   */
   async *chatStream(
     messages: LLMMessage[],
     options: ChatOptions,
   ): AsyncGenerator<StreamChunk, void, unknown> {
-    // Use AbortController so we can cancel the timeout once headers arrive
-    // (streaming the body can legitimately take much longer).
+    const body = JSON.stringify({
+      model: options.model,
+      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      stream: true,
+      options: {
+        ...(options.temperature != null && { temperature: options.temperature }),
+        ...(options.maxTokens != null && { num_predict: options.maxTokens }),
+      },
+    });
+
+    // Use XHR-based streaming in Zotero (avoids fetch() reliability issues).
+    // Fall back to fetch() in test environments where XMLHttpRequest is unavailable.
+    if ((globalThis as any).XMLHttpRequest) {
+      yield* this.xhrChatStream(body);
+    } else {
+      yield* this.fetchChatStream(body);
+    }
+  }
+
+  /**
+   * XHR-based NDJSON streaming via XMLHttpRequest + onprogress.
+   *
+   * Uses two timers:
+   *   - Connection timer (15s): aborts if no data arrives at all (Ollama not running).
+   *   - Idle timer (120s): resets on each onprogress; aborts if streaming stalls.
+   *
+   * The generator converts the event-based XHR API to an async iterator using
+   * a queue + signal pattern (single-threaded JS, no actual race conditions).
+   */
+  private async *xhrChatStream(
+    body: string,
+  ): AsyncGenerator<StreamChunk, void, unknown> {
+    const endpoint = this.endpoint; // Capture 'this' for use in closures.
+    const url = `${endpoint}/api/chat`;
+
+    const chunks: StreamChunk[] = [];
+    let xhrDone = false;
+    let xhrError: Error | null = null;
+    let signal: (() => void) | null = null;
+    let parseBuffer = "";
+    let processedLen = 0;
+
+    /** Wakes up the awaiting generator on new data or completion. */
+    function notify(): void {
+      if (signal) {
+        const s = signal;
+        signal = null;
+        s();
+      }
+    }
+
+    /** Parses newly arrived NDJSON text from the XHR response buffer. */
+    function drainBuffer(newText: string): void {
+      parseBuffer += newText;
+      const lines = parseBuffer.split("\n");
+      parseBuffer = lines.pop() ?? ""; // Keep last incomplete line.
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const data = JSON.parse(trimmed) as any;
+          chunks.push({
+            text: data.message?.content ?? "",
+            done: data.done === true,
+          });
+        } catch {
+          // Skip malformed NDJSON lines.
+        }
+      }
+    }
+
+    const xhr = new ((globalThis as any).XMLHttpRequest)();
+    xhr.open("POST", url, true /* async */);
+    xhr.setRequestHeader("Content-Type", "application/json");
+
+    // --- Connection timer: fires if Ollama never sends any data. ---
+    let connectionTimerCleared = false;
+    const connectionTimer = setTimeout(() => {
+      if (!connectionTimerCleared) {
+        xhr.abort();
+        xhrError = new Error(
+          `Ollama connection timed out at ${endpoint}. Is Ollama running?`,
+        );
+        xhrDone = true;
+        notify();
+      }
+    }, CONNECTION_TIMEOUT_MS);
+
+    // --- Idle timer: resets on each onprogress; fires if streaming stalls. ---
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function resetIdleTimer(): void {
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        xhr.abort();
+        xhrError = new Error(
+          "Ollama stream idle timeout — no data received for 2 minutes.",
+        );
+        xhrDone = true;
+        notify();
+      }, IDLE_READ_TIMEOUT_MS);
+    }
+
+    function clearAllTimers(): void {
+      if (!connectionTimerCleared) {
+        clearTimeout(connectionTimer);
+        connectionTimerCleared = true;
+      }
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    }
+
+    xhr.onprogress = () => {
+      // Clear connection timer on first data received.
+      if (!connectionTimerCleared) {
+        clearTimeout(connectionTimer);
+        connectionTimerCleared = true;
+      }
+      resetIdleTimer();
+
+      const newText = (xhr.responseText as string).slice(processedLen);
+      processedLen = (xhr.responseText as string).length;
+      drainBuffer(newText);
+      notify();
+    };
+
+    xhr.onload = () => {
+      clearAllTimers();
+
+      // Flush any remaining partial line from the buffer.
+      if (parseBuffer.trim()) {
+        try {
+          const data = JSON.parse(parseBuffer.trim()) as any;
+          chunks.push({ text: data.message?.content ?? "", done: true });
+        } catch {
+          chunks.push({ text: "", done: true });
+        }
+        parseBuffer = "";
+      }
+
+      // Guarantee the generator always receives a final done:true chunk.
+      if (chunks.length === 0 || !chunks[chunks.length - 1]!.done) {
+        chunks.push({ text: "", done: true });
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        xhrError = new Error(
+          `Ollama error ${xhr.status}: ${(xhr.responseText as string).slice(0, 200)}`,
+        );
+      }
+
+      xhrDone = true;
+      notify();
+    };
+
+    xhr.onerror = () => {
+      clearAllTimers();
+      xhrError = new Error(
+        `Ollama network connection failed. Is Ollama running at ${endpoint}?`,
+      );
+      xhrDone = true;
+      notify();
+    };
+
+    xhr.send(body);
+
+    // --- Async generator loop ---
+    // Processes the queue driven by XHR events; suspends between events.
+    try {
+      while (true) {
+        // Drain queued chunks first.
+        if (chunks.length > 0) {
+          const chunk = chunks.shift()!;
+          yield chunk;
+          if (chunk.done) return;
+          continue;
+        }
+        // Check terminal states.
+        if (xhrError) throw xhrError;
+        if (xhrDone) return;
+        // Wait for the next notify() call from an XHR event handler.
+        // Signal is set synchronously before we await, so no race condition.
+        await new Promise<void>((r) => {
+          signal = r;
+        });
+      }
+    } finally {
+      // Ensure XHR is aborted if the generator is abandoned (e.g. thrown or cancelled).
+      clearAllTimers();
+      if (!xhrDone) {
+        xhr.abort();
+      }
+    }
+  }
+
+  /**
+   * fetch()-based NDJSON streaming.
+   * Fallback for test environments where XMLHttpRequest is unavailable.
+   */
+  private async *fetchChatStream(
+    body: string,
+  ): AsyncGenerator<StreamChunk, void, unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT_MS);
 
@@ -79,19 +296,11 @@ export class OllamaProvider implements ILLMProvider {
       response = await fetch(`${this.endpoint}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: options.model,
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
-          stream: true,
-          options: {
-            ...(options.temperature != null && { temperature: options.temperature }),
-            ...(options.maxTokens != null && { num_predict: options.maxTokens }),
-          },
-        }),
+        body,
         signal: controller.signal,
       });
     } finally {
-      clearTimeout(timer); // Headers received — don't abort during streaming.
+      clearTimeout(timer);
     }
 
     if (!response.ok) {
@@ -100,41 +309,21 @@ export class OllamaProvider implements ILLMProvider {
     }
 
     const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error("Ollama response has no readable body.");
-    }
+    if (!reader) throw new Error("Ollama response has no readable body.");
 
     const decoder = new TextDecoder();
-    let buffer = "";
+    let buf = "";
 
     try {
       while (true) {
-        let idleTimer: ReturnType<typeof setTimeout> | undefined;
-        let readResult: ReadableStreamReadResult;
-        const readPromise = (reader as ReadableStreamDefaultReader<Uint8Array>).read();
-        // Suppress the AbortError that fires after idle-timeout aborts the stream,
-        // since Promise.race already picked up our descriptive timeout error.
-        readPromise.catch(() => {});
-        try {
-          readResult = await Promise.race([
-            readPromise,
-            new Promise<never>((_, reject) => {
-              idleTimer = setTimeout(() => {
-                controller.abort(); // Cancel the stream so the pending read() settles.
-                reject(new Error("Ollama stream idle timeout \u2014 no data received for 2 minutes."));
-              }, IDLE_READ_TIMEOUT_MS);
-            }),
-          ]);
-        } finally {
-          clearTimeout(idleTimer);
-        }
-        const { done, value } = readResult;
+        const { done, value } = await (
+          reader as ReadableStreamDefaultReader<Uint8Array>
+        ).read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true } as TextDecodeOptions);
-        const lines = buffer.split("\n");
-        // Keep the last (possibly incomplete) line in the buffer.
-        buffer = lines.pop() ?? "";
+        buf += decoder.decode(value, { stream: true } as TextDecodeOptions);
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
 
         for (const line of lines) {
           const trimmed = line.trim();
@@ -143,36 +332,43 @@ export class OllamaProvider implements ILLMProvider {
             const data = JSON.parse(trimmed) as any;
             const text = data.message?.content ?? "";
             const isDone = data.done === true;
-            if (text || isDone) {
-              yield { text, done: isDone };
-            }
+            if (text || isDone) yield { text, done: isDone };
           } catch {
-            // Skip malformed JSON lines.
+            // Skip malformed NDJSON lines.
           }
         }
       }
 
-      // Process any remaining buffer.
-      if (buffer.trim()) {
+      // Flush remaining buffer.
+      if (buf.trim()) {
         try {
-          const data = JSON.parse(buffer.trim()) as any;
+          const data = JSON.parse(buf.trim()) as any;
           yield { text: data.message?.content ?? "", done: true };
         } catch {
           yield { text: "", done: true };
         }
       }
     } finally {
-      controller.abort(); // Ensure stream is torn down on any exit path.
-      try { reader.releaseLock(); } catch { /* already released or pending settled via abort */ }
+      controller.abort();
+      try {
+        reader.releaseLock();
+      } catch {
+        /* already released */
+      }
     }
   }
 
+  /**
+   * Tests connectivity by checking the Ollama model list endpoint.
+   * Uses Zotero.HTTP.request (via httpGet) so it routes through the system proxy.
+   */
   async isAvailable(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.endpoint}/api/tags`, {
-        method: "GET",
-        signal: AbortSignal.timeout(3000),
-      });
+      const response = await httpGet(
+        `${this.endpoint}/api/tags`,
+        {},
+        3_000,
+      );
       return response.ok;
     } catch {
       return false;

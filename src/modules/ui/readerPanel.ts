@@ -339,6 +339,7 @@ async function handleQuestion(
 
   let fullResponse = "";
   let pipeline;
+  let usedStream = true; // Flipped to false if streaming fails and we fall back to chat().
 
   try {
     // Build conversation history for the pipeline.
@@ -416,10 +417,12 @@ async function handleQuestion(
         throw streamErr;
       }
 
-      // Some environments/proxies break SSE but allow non-stream requests.
-      updateStatusNote(
-        statusNote,
-        `Streaming failed. Retrying ${provider.name} without streaming\u2026`,
+      // Silent non-stream fallback — keep the existing "Connecting…" status note
+      // so the user sees no error flash. The diagnostics footer will show "non-stream".
+      usedStream = false;
+      ztoolkit.log(
+        "chatStream() failed; retrying without streaming:",
+        (streamErr as Error)?.message ?? streamErr,
       );
       const nonStreamText = await provider.chat(pipeline.messages, {
         ...options,
@@ -477,11 +480,15 @@ async function handleQuestion(
     ztoolkit.log("Failed to save assistant message to DB:", dbErr?.message ?? dbErr);
   });
 
-  // D7: Token usage indicator.
+  // D7: Diagnostics footer — model · host · mode · tokens.
   const totalTokens =
     estimateTokens(pipeline.messages.map((m) => m.content).join("")) +
     estimateTokens(fullResponse);
-  appendSystemNote(messages, doc, `~${totalTokens.toLocaleString()} tokens used`);
+  appendSystemNote(
+    messages,
+    doc,
+    buildDiagnosticsNote(options.model, usedStream, totalTokens),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +810,61 @@ function shouldRetryNonStream(err: any): boolean {
     err?.name === "TimeoutError" ||
     /timeout|timed out|idle timeout|abort|network|failed to fetch|stream/.test(raw)
   );
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the diagnostics footer string appended after each LLM response.
+ *
+ * Format: `{model} · {host} · {mode} · ~{tokens} tokens`
+ * Example: `gpt-4o-mini · api.openai.com · stream · ~4,231 tokens`
+ *
+ * Redaction rules (ROADMAP §diagnostics):
+ *   - Only the hostname is shown — no path, no query parameters, no port.
+ *   - API keys and Authorization headers are never present in the host string.
+ *   - The formatter is the sole owner of redaction; callers pass raw values.
+ */
+function buildDiagnosticsNote(
+  model: string,
+  usedStream: boolean,
+  tokens: number,
+): string {
+  const host = getProviderDisplayHost();
+  const mode = usedStream ? "stream" : "non-stream";
+  return `${model} \u00b7 ${host} \u00b7 ${mode} \u00b7 ~${tokens.toLocaleString()} tokens`;
+}
+
+/**
+ * Returns a safe display hostname for the currently active provider.
+ * Only the `host` portion of the endpoint URL is returned (no path, query, or auth).
+ * Falls back to the provider name string if URL parsing fails.
+ */
+function getProviderDisplayHost(): string {
+  const name = prefs.getActiveProvider();
+  try {
+    switch (name) {
+      case "ollama":
+        return new URL(prefs.getOllamaEndpoint()).host;
+      case "gemini":
+        return "generativelanguage.googleapis.com";
+      case "openai":
+        return new URL(prefs.getOpenAIEndpoint()).host;
+      case "anthropic":
+        return "api.anthropic.com";
+      case "custom": {
+        const ep = prefs.getCustomEndpoint();
+        return ep ? new URL(ep).host : "custom";
+      }
+      default:
+        return name;
+    }
+  } catch {
+    // URL parsing failed (e.g. malformed endpoint pref) — degrade gracefully.
+    return name;
+  }
 }
 
 // ---------------------------------------------------------------------------

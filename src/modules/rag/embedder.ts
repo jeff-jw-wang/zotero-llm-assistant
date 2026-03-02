@@ -104,10 +104,50 @@ class MainThreadRunner implements EmbeddingRunner {
   private async loadPipeline(
     onProgress?: (p: number) => void,
   ): Promise<any> {
+    // --- Console shim (must come before the Transformers.js import) ---
+    // In Zotero's privileged chrome context, `console` is undefined.
+    // Transformers.js calls console.log/warn internally; without this shim
+    // those calls throw ReferenceError and crash model loading (Issue #1).
+    if (typeof (globalThis as any).console === "undefined") {
+      const safeLog = (...args: any[]) => {
+        try {
+          ztoolkit.log("[TF.js]", ...args);
+        } catch {
+          /* ztoolkit itself unavailable — silently discard */
+        }
+      };
+      (globalThis as any).console = {
+        log: safeLog,
+        warn: safeLog,
+        error: safeLog,
+        info: safeLog,
+        debug: () => {},
+        group: () => {},
+        groupEnd: () => {},
+        groupCollapsed: () => {},
+        time: () => {},
+        timeEnd: () => {},
+        trace: () => {},
+        dir: () => {},
+        table: () => {},
+        assert: () => {},
+      };
+      ztoolkit.log("Embedder: installed console shim for Transformers.js");
+    }
+
     // Dynamic import to avoid loading Transformers.js at module parse time.
-    const { pipeline } = await import(
+    // env: configure before pipeline() to suppress unnecessary FS probing.
+    const { pipeline, env } = (await import(
       /* webpackIgnore: true */ "@huggingface/transformers"
-    );
+    )) as any;
+
+    // Suppress Transformers.js's local-model filesystem probing, which fails
+    // (and logs loudly) in chrome contexts that have no writable local path.
+    if (env) {
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+    }
+
     const opts: any = {
       revision: PINNED_REVISION,
       quantized: true,
@@ -324,6 +364,17 @@ export async function ensureModelReady(
   if (!prefs.isEmbeddingModelAccepted()) {
     throw new Error(
       "Embedding model consent not given. User must accept before download.",
+    );
+  }
+
+  // Context guard: Transformers.js dynamic imports and IndexedDB (used for
+  // model caching) both fail in Zotero's reader panel privileged chrome frame.
+  // IndexedDB availability is the reliable proxy for "am I in the main window?"
+  // — it is defined in the main window context but undefined in reader panels.
+  if (typeof (globalThis as any).indexedDB === "undefined") {
+    throw new Error(
+      "ensureModelReady() must be called from the main Zotero window, not from a " +
+        "reader panel context. Call it from hooks.ts onStartup() or the Settings pane.",
     );
   }
 
