@@ -1,9 +1,0 @@
-node_modules/
-.scaffold/
-*.xpi
-.env
-.DS_Store
-.claude/
-PLAN*.md
-tsconfig.tsbuildinfo
-.github/workflows/

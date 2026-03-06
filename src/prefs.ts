@@ -160,6 +160,57 @@ export function setCustomModel(model: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Per-item privacy mirror (Zotero.Prefs fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads per-item private flag from Zotero.Prefs mirror.
+ *
+ * This exists because IndexedDB is unavailable in the reader panel's privileged
+ * chrome context. When `isItemPrivate()` from db.ts fails due to missing
+ * IndexedDB, `checkPrivacy()` in client.ts falls back to this Prefs-based
+ * mirror so the privacy check is fail-closed rather than fail-open.
+ *
+ * The mirror stores item IDs as a JSON-encoded array of numbers.
+ */
+export function isItemPrivatePref(itemId: number): boolean {
+  const raw = (getPref("privacy.privateItemIds") as string) || "[]";
+  try {
+    const ids: number[] = JSON.parse(raw);
+    return ids.includes(itemId);
+  } catch {
+    // Corrupt pref — fail-closed: assume private.
+    return true;
+  }
+}
+
+/**
+ * Writes per-item private flag to the Zotero.Prefs mirror.
+ *
+ * Called alongside `setItemPrivacy()` in privacyToggle.ts to keep the
+ * mirror in sync with IndexedDB.
+ */
+export function setItemPrivatePref(itemId: number, isPrivate: boolean): void {
+  const raw = (getPref("privacy.privateItemIds") as string) || "[]";
+  let ids: number[];
+  try {
+    ids = JSON.parse(raw);
+    if (!Array.isArray(ids)) ids = [];
+  } catch {
+    ids = [];
+  }
+
+  const index = ids.indexOf(itemId);
+  if (isPrivate && index === -1) {
+    ids.push(itemId);
+  } else if (!isPrivate && index !== -1) {
+    ids.splice(index, 1);
+  }
+
+  setPref("privacy.privateItemIds", JSON.stringify(ids));
+}
+
+// ---------------------------------------------------------------------------
 // Embeddings (Phase D)
 // ---------------------------------------------------------------------------
 
@@ -185,4 +236,27 @@ export function getEmbeddingModelRevision(): string {
 
 export function setEmbeddingModelRevision(revision: string): void {
   setPref("embeddings.modelRevision", revision);
+}
+
+/**
+ * Whether semantic embeddings are known to be unsupported in the current
+ * Zotero runtime (e.g. Transformers backend incompatibility).
+ */
+export function isEmbeddingRuntimeUnsupported(): boolean {
+  return getPref("embeddings.runtimeUnsupported") === true;
+}
+
+export function setEmbeddingRuntimeUnsupported(unsupported: boolean): void {
+  setPref("embeddings.runtimeUnsupported", unsupported);
+}
+
+/**
+ * Last known runtime incompatibility reason for semantic embeddings.
+ */
+export function getEmbeddingRuntimeUnsupportedReason(): string {
+  return (getPref("embeddings.runtimeUnsupportedReason") as string) || "";
+}
+
+export function setEmbeddingRuntimeUnsupportedReason(reason: string): void {
+  setPref("embeddings.runtimeUnsupportedReason", reason);
 }

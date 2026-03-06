@@ -26,6 +26,34 @@ const CONNECTION_TIMEOUT_MS = 30_000;
 /** Idle-read timeout (ms) — abort if no streaming data arrives for this long. */
 const IDLE_READ_TIMEOUT_MS = 60_000;
 
+/**
+ * Formats a Gemini API error into a user-friendly message.
+ * Prevents dumping raw JSON error bodies into the chat UI.
+ */
+function formatGeminiError(status: number, rawText: string): Error {
+  if (status === 429) {
+    return new Error(
+      "Gemini API quota exceeded. The free tier has limited requests per day.\n" +
+        "• Wait a few minutes and try again, or\n" +
+        "• Switch to Ollama (local, unlimited) in Settings.",
+    );
+  }
+  if (status === 403) {
+    return new Error(
+      "Gemini API access denied. Check that your API key is valid in Settings.",
+    );
+  }
+  // For other errors, try to extract a short message from the JSON body.
+  try {
+    const data = JSON.parse(rawText);
+    const msg: string =
+      data?.error?.message ?? data?.error?.status ?? rawText.slice(0, 200);
+    return new Error(`Gemini error (${status}): ${msg}`);
+  } catch {
+    return new Error(`Gemini error (${status}): ${rawText.slice(0, 200)}`);
+  }
+}
+
 export class GeminiProvider implements ILLMProvider {
   readonly name = "Google Gemini";
   readonly isCloud = true;
@@ -79,7 +107,7 @@ export class GeminiProvider implements ILLMProvider {
     }, CONNECTION_TIMEOUT_MS);
 
     if (!res.ok) {
-      throw new Error(`Gemini error ${res.status}: ${res.text}`);
+      throw formatGeminiError(res.status, res.text);
     }
 
     const data = res.json();
@@ -113,7 +141,7 @@ export class GeminiProvider implements ILLMProvider {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`Gemini error ${response.status}: ${text}`);
+      throw formatGeminiError(response.status, text);
     }
 
     const reader = response.body?.getReader();
