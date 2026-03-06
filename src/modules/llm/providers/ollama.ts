@@ -23,6 +23,7 @@ import type {
 import { httpPost, httpGet } from "../../../utils/http";
 
 const DEFAULT_ENDPOINT = "http://localhost:11434";
+const DEFAULT_NUM_CTX = 16_384;
 
 /** Connection timeout (ms) — fires if no response data arrives within this window. */
 const CONNECTION_TIMEOUT_MS = 15_000;
@@ -50,22 +51,41 @@ export class OllamaProvider implements ILLMProvider {
    * chatStream() fails.
    */
   async chat(messages: LLMMessage[], options: ChatOptions): Promise<string> {
-    const response = await httpPost(
-      `${this.endpoint}/api/chat`,
+    let response;
+    try {
+      response = await httpPost(
+        `${this.endpoint}/api/chat`,
       JSON.stringify({
         model: options.model,
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         stream: false,
         options: {
+          num_ctx: DEFAULT_NUM_CTX,
           ...(options.temperature != null && { temperature: options.temperature }),
           ...(options.maxTokens != null && { num_predict: options.maxTokens }),
         },
       }),
-      { "Content-Type": "application/json" },
-      CONNECTION_TIMEOUT_MS,
-    );
+        { "Content-Type": "application/json" },
+        CONNECTION_TIMEOUT_MS,
+      );
+    } catch (err: any) {
+      // Transport error — connection refused, DNS failure, timeout.
+      throw new Error(
+        `Cannot connect to Ollama at ${this.endpoint}. ` +
+          "Make sure Ollama is running (ollama serve). " +
+          `Details: ${(err as Error)?.message ?? err}`,
+      );
+    }
 
     if (!response.ok) {
+      // Status 0 means the request was blocked or connection was refused at
+      // the transport layer (e.g. Zotero's chrome security, CSP, or Ollama not running).
+      if (response.status === 0) {
+        throw new Error(
+          `Cannot connect to Ollama at ${this.endpoint}. ` +
+            "Make sure Ollama is running (ollama serve).",
+        );
+      }
       throw new Error(`Ollama error ${response.status}: ${response.text}`);
     }
 
@@ -89,6 +109,7 @@ export class OllamaProvider implements ILLMProvider {
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
       stream: true,
       options: {
+        num_ctx: DEFAULT_NUM_CTX,
         ...(options.temperature != null && { temperature: options.temperature }),
         ...(options.maxTokens != null && { num_predict: options.maxTokens }),
       },
@@ -214,6 +235,20 @@ export class OllamaProvider implements ILLMProvider {
 
     xhr.onload = () => {
       clearAllTimers();
+
+      // Status 0 means the request was blocked or connection was refused at
+      // the transport layer (chrome CSP, Ollama not running, etc.). Treat
+      // this as a network error so the caller's retry logic (shouldRetryNonStream)
+      // can fall back to the non-stream Zotero.HTTP.request path.
+      if (xhr.status === 0) {
+        xhrError = new Error(
+          `Ollama network error: cannot connect to ${endpoint}. ` +
+            "Make sure Ollama is running (ollama serve).",
+        );
+        xhrDone = true;
+        notify();
+        return;
+      }
 
       // Flush any remaining partial line from the buffer.
       if (parseBuffer.trim()) {

@@ -21,8 +21,11 @@ import { config } from "../../../package.json";
 import * as prefs from "../../prefs";
 import { validateEndpointURL, preflightDNSCheck } from "../../utils/url";
 import { isModelReady, isModelRevisionCurrent, ensureModelReady, disposeEmbedder } from "../rag/embedder";
+import { OllamaProvider } from "../llm/providers/ollama";
+import { httpGet } from "../../utils/http";
 
 const ID = (suffix: string) => `zotero-prefpane-${config.addonRef}-${suffix}`;
+const OLLAMA_DOWNLOAD_URL = "https://ollama.com/download";
 
 // All providers with sections in preferences.xhtml.
 const ALL_PROVIDERS = ["ollama", "gemini", "openai", "anthropic", "custom"] as const;
@@ -49,6 +52,9 @@ export function registerPrefsScripts(win: Window): void {
       const selected = providerEl.value as prefs.ProviderName;
       prefs.setActiveProvider(selected);
       updateSectionVisibility(doc, selected);
+      if (selected === "ollama") {
+        void refreshOllamaEnvironmentStatus(doc);
+      }
     });
   }
 
@@ -64,6 +70,7 @@ export function registerPrefsScripts(win: Window): void {
   // --- Ollama ---
   bindText(doc, ID("ollama-endpoint"), prefs.getOllamaEndpoint(), prefs.setOllamaEndpoint);
   bindText(doc, ID("ollama-model"), prefs.getOllamaModel(), prefs.setOllamaModel);
+  bindOllamaEnvironment(doc);
 
   // --- Gemini ---
   bindText(doc, ID("gemini-apikey"), prefs.getGeminiApiKey(), prefs.setGeminiApiKey);
@@ -149,6 +156,145 @@ function bindText(
   el.addEventListener("change", save);
   // Backup: in some XUL panel contexts "change" may not fire on blur.
   el.addEventListener("blur", save);
+}
+
+// ---------------------------------------------------------------------------
+// Ollama environment checks
+// ---------------------------------------------------------------------------
+
+/**
+ * Binds Ollama status/check/install controls in Settings.
+ * Detects whether Ollama is reachable at the configured endpoint and whether
+ * the configured model appears in `/api/tags`.
+ */
+function bindOllamaEnvironment(doc: Document): void {
+  const checkBtn = doc.getElementById(ID("ollama-check-btn")) as any;
+  const installBtn = doc.getElementById(ID("ollama-install-btn")) as any;
+  const endpointEl = doc.getElementById(ID("ollama-endpoint")) as HTMLInputElement | null;
+  const modelEl = doc.getElementById(ID("ollama-model")) as HTMLInputElement | null;
+
+  if (checkBtn) {
+    checkBtn.addEventListener("command", () => {
+      void refreshOllamaEnvironmentStatus(doc);
+    });
+  }
+
+  if (installBtn) {
+    installBtn.addEventListener("command", () => {
+      openExternalURL(OLLAMA_DOWNLOAD_URL);
+    });
+  }
+
+  const refresh = () => {
+    void refreshOllamaEnvironmentStatus(doc);
+  };
+  endpointEl?.addEventListener("change", refresh);
+  endpointEl?.addEventListener("blur", refresh);
+  modelEl?.addEventListener("change", refresh);
+  modelEl?.addEventListener("blur", refresh);
+
+  // Initial status on load.
+  refresh();
+}
+
+/**
+ * Updates the inline Ollama status message and install-button visibility.
+ */
+async function refreshOllamaEnvironmentStatus(doc: Document): Promise<void> {
+  const statusEl = doc.getElementById(ID("ollama-status")) as HTMLElement | null;
+  const installBtn = doc.getElementById(ID("ollama-install-btn")) as any;
+  const checkBtn = doc.getElementById(ID("ollama-check-btn")) as any;
+  if (!statusEl) return;
+
+  if (prefs.getActiveProvider() !== "ollama") {
+    statusEl.textContent = "";
+    if (installBtn) installBtn.hidden = true;
+    if (checkBtn) checkBtn.disabled = false;
+    return;
+  }
+
+  const endpoint = prefs.getOllamaEndpoint().trim() || "http://localhost:11434";
+  const model = prefs.getOllamaModel().trim() || "llama3.2";
+  const provider = new OllamaProvider(endpoint);
+
+  if (checkBtn) checkBtn.disabled = true;
+  statusEl.style.color = "#666";
+  statusEl.textContent = `Checking Ollama at ${endpoint}...`;
+
+  try {
+    const available = await provider.isAvailable();
+    if (!available) {
+      statusEl.style.color = "#dc2626";
+      statusEl.textContent =
+        `Ollama not detected at ${endpoint}. Install Ollama, run "ollama serve", then pull a model (e.g. "ollama pull ${model}").`;
+      if (installBtn) installBtn.hidden = false;
+      return;
+    }
+
+    const modelAvailable = await isOllamaModelAvailable(endpoint, model);
+    if (modelAvailable === false) {
+      statusEl.style.color = "#b45309";
+      statusEl.textContent =
+        `Ollama is running, but model "${model}" is missing. Run: ollama pull ${model}`;
+      if (installBtn) installBtn.hidden = true;
+      return;
+    }
+
+    statusEl.style.color = "#16a34a";
+    statusEl.textContent = `✓ Ollama is ready at ${endpoint}.`;
+    if (installBtn) installBtn.hidden = true;
+  } catch (err: any) {
+    statusEl.style.color = "#dc2626";
+    statusEl.textContent =
+      `Could not check Ollama at ${endpoint}: ${err?.message ?? String(err)}`;
+    if (installBtn) installBtn.hidden = false;
+  } finally {
+    if (checkBtn) checkBtn.disabled = false;
+  }
+}
+
+/**
+ * Best-effort check: does `/api/tags` include the configured model name?
+ */
+async function isOllamaModelAvailable(
+  endpoint: string,
+  model: string,
+): Promise<boolean | null> {
+  try {
+    const url = `${endpoint.replace(/\/+$/, "")}/api/tags`;
+    const res = await httpGet(url, {}, 3000);
+    if (!res.ok) return null;
+    const data = res.json() as any;
+    const names: string[] = Array.isArray(data?.models)
+      ? data.models.map((m: any) => String(m?.name ?? ""))
+      : [];
+    if (!model) return null;
+    const normalized = model.toLowerCase();
+    return names.some((name) => {
+      const lower = name.toLowerCase();
+      return lower === normalized || lower.startsWith(`${normalized}:`);
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Opens an external URL from the Settings pane.
+ */
+function openExternalURL(url: string): void {
+  try {
+    (Zotero as any).launchURL?.(url);
+    return;
+  } catch {
+    // fall through
+  }
+  try {
+    const win = Zotero.getMainWindow() as any;
+    win?.ZoteroPane?.loadURI?.(url);
+  } catch {
+    // no-op
+  }
 }
 
 /**
@@ -283,6 +429,9 @@ function bindSemanticSearch(doc: Document): void {
       try {
         // Ensure consent is set (idempotent).
         prefs.setEmbeddingModelAccepted(true);
+        // Clear previous runtime-incompatibility state before a new attempt.
+        prefs.setEmbeddingRuntimeUnsupported(false);
+        prefs.setEmbeddingRuntimeUnsupportedReason("");
 
         await ensureModelReady((progress: number) => {
           if (statusEl) {
@@ -291,21 +440,96 @@ function bindSemanticSearch(doc: Document): void {
         });
 
         // Success.
+        prefs.setEmbeddingRuntimeUnsupported(false);
+        prefs.setEmbeddingRuntimeUnsupportedReason("");
         if (statusEl) {
           statusEl.textContent = "\u2713 Model ready";
           statusEl.style.color = "#16a34a"; // green
         }
         downloadBtn.hidden = true;
       } catch (err: any) {
-        // Failure — show retry UI (Case B from plan).
+        const message = getErrorMessage(err);
+
+        // Known runtime limitation in Zotero chrome context:
+        // transformers -> onnx backend may attempt node-only modules.
+        if (isSemanticBackendUnsupportedError(message)) {
+          prefs.setEmbeddingRuntimeUnsupported(true);
+          prefs.setEmbeddingRuntimeUnsupportedReason(message);
+          if (statusEl) {
+            statusEl.textContent =
+              "Semantic search is currently unavailable in this Zotero runtime " +
+              "(transformers backend incompatibility). Keyword search remains available.";
+            statusEl.style.color = "#dc2626"; // red
+          }
+          downloadBtn.hidden = false;
+          downloadBtn.disabled = false;
+          downloadBtn.label = "Retry Download";
+          return;
+        }
+
+        // Failure — show retry UI for transient errors.
+        prefs.setEmbeddingRuntimeUnsupported(false);
+        prefs.setEmbeddingRuntimeUnsupportedReason("");
         if (statusEl) {
-          statusEl.textContent = `Download failed: ${err?.message ?? "unknown error"}`;
+          statusEl.textContent = `Download failed: ${message}`;
           statusEl.style.color = "#dc2626"; // red
         }
         downloadBtn.label = "Retry Download";
         downloadBtn.disabled = false;
       }
     });
+  }
+}
+
+/**
+ * Detects known semantic-runtime incompatibility errors where retrying is futile.
+ */
+export function isSemanticBackendUnsupportedError(message: string): boolean {
+  const raw = String(message).toLowerCase();
+  return (
+    /dynamic require of ['"]node:os['"]/.test(raw) ||
+    (raw.includes("dynamic require") && raw.includes("node:os")) ||
+    raw.includes("node:os") ||
+    raw.includes("no available backend found") ||
+    raw.includes("no available backends found") ||
+    (raw.includes("backend") && raw.includes("wasm") && raw.includes("not supported")) ||
+    (raw.includes("onnx") && raw.includes("node:os"))
+  );
+}
+
+/**
+ * Best-effort error message extraction across Error/string/object/cause shapes.
+ */
+function getErrorMessage(err: any): string {
+  if (!err) return "unknown error";
+  if (typeof err === "string") return err;
+
+  const candidates: string[] = [];
+
+  const push = (value: any) => {
+    if (!value) return;
+    if (typeof value === "string") {
+      if (value.trim()) candidates.push(value);
+      return;
+    }
+    if (typeof value?.message === "string" && value.message.trim()) {
+      candidates.push(value.message);
+    }
+  };
+
+  push(err);
+  push(err?.cause);
+  push(err?.error);
+
+  if (candidates.length > 0) {
+    return candidates.join(" | ");
+  }
+
+  try {
+    const raw = JSON.stringify(err);
+    return raw || "unknown error";
+  } catch {
+    return String(err);
   }
 }
 
@@ -336,6 +560,8 @@ export function computeSemanticUIState(
   modelReadyState: boolean,
   revisionCurrent: boolean,
   hasStoredRevision: boolean,
+  unsupportedRuntime = false,
+  unsupportedReason = "",
 ): SemanticUIState {
   if (!accepted) {
     return {
@@ -354,6 +580,19 @@ export function computeSemanticUIState(
       buttonHidden: true,
       buttonDisabled: false,
       buttonLabel: "",
+    };
+  }
+
+  if (unsupportedRuntime) {
+    const reasonHint = unsupportedReason
+      ? " (backend incompatible in this runtime)"
+      : "";
+    return {
+      statusText: `Semantic search unavailable${reasonHint}`,
+      statusColor: "#dc2626",
+      buttonHidden: false,
+      buttonDisabled: false,
+      buttonLabel: "Retry Download",
     };
   }
 
@@ -398,6 +637,8 @@ function updateSemanticUI(
     isModelReady(),
     isModelRevisionCurrent(),
     prefs.getEmbeddingModelRevision() !== "",
+    prefs.isEmbeddingRuntimeUnsupported(),
+    prefs.getEmbeddingRuntimeUnsupportedReason(),
   );
 
   statusEl.textContent = state.statusText;

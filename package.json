@@ -23,6 +23,9 @@
     "test:chunker": "tsx test/chunker.test.ts",
     "test:phase-c": "tsx test/phase-c.test.ts",
     "test:phase-d": "tsx test/phase-d.test.ts",
+    "test:privacy": "tsx test/privacy-fallback.test.ts",
+    "test:privacy-mismatch": "tsx test/privacy-mismatch.test.ts",
+    "test:qa-fixes": "tsx test/qa-fixes.test.ts",
     "release": "zotero-plugin release"
   },
   "dependencies": {

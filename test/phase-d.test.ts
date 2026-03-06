@@ -434,7 +434,7 @@ test("5 chars → 2 tokens (rounds up)", () => {
 // ===========================================================================
 
 const { parseLibraryLinks } = await import("../src/modules/library/searcher");
-const { computeSemanticUIState } = await import("../src/modules/ui/settingsPane");
+const { computeSemanticUIState, isSemanticBackendUnsupportedError } = await import("../src/modules/ui/settingsPane");
 
 console.log("\n=== parseLibraryLinks() Regression Tests ===\n");
 
@@ -471,6 +471,40 @@ test("revision current + not ready shows manual recovery (Load Model)", () => {
   assert.equal(state.buttonHidden, false);
   assert.equal(state.buttonDisabled, false);
   assert.equal(state.buttonLabel, "Load Model");
+});
+
+test("unsupported runtime state shows retry with clear unavailable status", () => {
+  const state = computeSemanticUIState(
+    true,  // consent accepted
+    false, // model not loaded
+    false, // revision not current
+    false, // no stored revision
+    true,  // runtime unsupported
+    "no available backend found",
+  );
+
+  assert.match(state.statusText, /semantic search unavailable/i);
+  assert.equal(state.statusColor, "#dc2626");
+  assert.equal(state.buttonHidden, false);
+  assert.equal(state.buttonDisabled, false);
+  assert.equal(state.buttonLabel, "Retry Download");
+});
+
+test("unsupported backend matcher catches node:os + backend variants", () => {
+  assert.equal(
+    isSemanticBackendUnsupportedError(
+      "no available backend found. ERR: [wasm] Error: Dynamic require of 'node:os' is not supported",
+    ),
+    true,
+  );
+  assert.equal(
+    isSemanticBackendUnsupportedError("ONNX runtime failed: node:os import error"),
+    true,
+  );
+  assert.equal(
+    isSemanticBackendUnsupportedError("network timeout contacting model host"),
+    false,
+  );
 });
 
 // ===========================================================================
