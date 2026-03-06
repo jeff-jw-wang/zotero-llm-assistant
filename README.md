@@ -19,7 +19,9 @@ AI-powered research assistant for Zotero — chat with papers, search your libra
 
 ## Download
 
-> **[⬇ Download zotero-llm-assistant.xpi (latest)](https://github.com/jeff-jw-wang/zotero-llm-assistant/releases/latest/download/zotero-llm-assistant.xpi)**
+> **[⬇ Download zotero-llm-assistant.xpi — v0.1.0 (latest)](https://github.com/jeff-jw-wang/zotero-llm-assistant/releases/latest/download/zotero-llm-assistant.xpi)**
+>
+> *Update this version number when a new release is published.*
 
 ## Installation
 
