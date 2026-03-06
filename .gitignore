@@ -3,9 +3,4 @@ node_modules/
 *.xpi
 .env
 .DS_Store
-.claude/
-PLAN*.md
-PROGRESS.md
 tsconfig.tsbuildinfo
-.github/workflows/
-CLAUDE.md
