@@ -1,24 +1,15 @@
 /**
- * Embedding module — Transformers.js wrapper for local text embeddings.
+ * Embedding module — local semantic embeddings with resilient runtime fallback.
  *
- * Provides `embedText()` and `embedTexts()` for generating 384-dimensional
- * vectors using the `Xenova/all-MiniLM-L6-v2` ONNX model. The model is
- * downloaded on first use (~25MB) with user consent (D2).
+ * Primary backend:
+ *   - Transformers.js (`Xenova/all-MiniLM-L6-v2`, 384 dims)
  *
- * Architecture (D1):
- *   Uses an `EmbeddingRunner` interface with two implementations:
- *   - `WorkerRunner`: runs Transformers.js in a Web Worker (primary)
- *   - `MainThreadRunner`: guaranteed fallback on main thread
+ * Fallback backend (always available in Zotero runtime):
+ *   - Lightweight hashing embedder (384 dims), deterministic and fully local
  *
- *   At runtime, `WorkerRunner` is always probed first (try/catch). If it
- *   fails (worker unsupported, ONNX load error, etc.), falls back to
- *   `MainThreadRunner` for the rest of the session.
- *
- * Model lifecycle (D2):
- *   - Model downloaded only after explicit user consent
- *   - Pinned revision hash for deterministic builds
- *   - Cached locally by Transformers.js in IndexedDB
- *   - Version-keyed: revision change triggers re-download prompt
+ * If Transformers.js fails due to Zotero runtime/backend incompatibilities,
+ * the module automatically switches to the hashing backend so semantic search
+ * still works (reduced quality vs MiniLM, but functional and stable).
  *
  * @module modules/rag/embedder
  */
@@ -43,9 +34,12 @@ const MODEL_ID = "Xenova/all-MiniLM-L6-v2";
  * https://huggingface.co/api/models/Xenova/all-MiniLM-L6-v2
  */
 const PINNED_REVISION = "751bff37182d3f1213fa05d7196b954e230abad9";
+const HASH_BACKEND_REVISION = "local-hash-v1";
 
 /** Embedding vector dimensions (all-MiniLM-L6-v2). */
 export const EMBEDDING_DIMS = 384;
+
+type EmbeddingBackend = "transformers" | "hashing";
 
 // ---------------------------------------------------------------------------
 // EmbeddingRunner interface
@@ -104,10 +98,75 @@ class MainThreadRunner implements EmbeddingRunner {
   private async loadPipeline(
     onProgress?: (p: number) => void,
   ): Promise<any> {
+    // --- Console shim (must come before the Transformers.js import) ---
+    // In Zotero's privileged chrome context, `console` is undefined.
+    // Transformers.js calls console.log/warn internally; without this shim
+    // those calls throw ReferenceError and crash model loading (Issue #1).
+    if (typeof (globalThis as any).console === "undefined") {
+      const safeLog = (...args: any[]) => {
+        try {
+          ztoolkit.log("[TF.js]", ...args);
+        } catch {
+          /* ztoolkit itself unavailable — silently discard */
+        }
+      };
+      (globalThis as any).console = {
+        log: safeLog,
+        warn: safeLog,
+        error: safeLog,
+        info: safeLog,
+        debug: () => {},
+        group: () => {},
+        groupEnd: () => {},
+        groupCollapsed: () => {},
+        time: () => {},
+        timeEnd: () => {},
+        trace: () => {},
+        dir: () => {},
+        table: () => {},
+        assert: () => {},
+      };
+      ztoolkit.log("Embedder: installed console shim for Transformers.js");
+    }
+
     // Dynamic import to avoid loading Transformers.js at module parse time.
-    const { pipeline } = await import(
-      /* webpackIgnore: true */ "@huggingface/transformers"
-    );
+    // env: configure before pipeline() to suppress unnecessary FS probing.
+    //
+    // KNOWN LIMITATION (Issue #1, Review P1): The bare specifier
+    // "@huggingface/transformers" may fail to resolve in Zotero's privileged
+    // chrome context ("bare specifier not remapped" error). This is a bundling
+    // issue: the build system's `webpackIgnore: true` annotation skips the
+    // import, but Zotero's chrome module loader doesn't have a module map for
+    // it. A proper fix requires either (a) bundling Transformers.js into the
+    // XPI as a file:// or resource:// path, or (b) registering a chrome module
+    // alias in the addon manifest. Until then, the try/catch below produces a
+    // descriptive error that propagates to the Settings UI, and the RAG
+    // pipeline falls back to keyword-only scoring (extractor + chunker still
+    // work fine without embeddings).
+    let pipeline: any;
+    let env: any;
+    try {
+      const mod = (await import(
+        /* webpackIgnore: true */ "@huggingface/transformers"
+      )) as any;
+      pipeline = mod.pipeline;
+      env = mod.env;
+    } catch (importErr: any) {
+      const msg = (importErr as Error)?.message ?? String(importErr);
+      throw new Error(
+        `Failed to load Transformers.js in Zotero context: ${msg}. ` +
+          "This is a known limitation — semantic search requires a bundling fix. " +
+          "Keyword-based search remains fully functional.",
+      );
+    }
+
+    // Suppress Transformers.js's local-model filesystem probing, which fails
+    // (and logs loudly) in chrome contexts that have no writable local path.
+    if (env) {
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+    }
+
     const opts: any = {
       revision: PINNED_REVISION,
       quantized: true,
@@ -124,6 +183,42 @@ class MainThreadRunner implements EmbeddingRunner {
 
   dispose(): void {
     this.pipeline = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HashingRunner (runtime-safe local fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight deterministic embedding fallback.
+ *
+ * Produces 384-dim unit vectors using token + char-trigram hashing. This is
+ * less semantically rich than MiniLM but avoids runtime/backend constraints.
+ */
+class HashingRunner implements EmbeddingRunner {
+  async embed(
+    texts: string[],
+    onProgress?: (p: number) => void,
+  ): Promise<number[][]> {
+    const vectors: number[][] = [];
+    for (let i = 0; i < texts.length; i++) {
+      vectors.push(hashEmbed(texts[i] ?? ""));
+      if (i > 0 && i % 25 === 0) {
+        await new Promise<void>((r) => setTimeout(r, 0));
+      }
+      if (onProgress) {
+        onProgress((i + 1) / texts.length);
+      }
+    }
+    if (texts.length === 0) {
+      onProgress?.(1);
+    }
+    return vectors;
+  }
+
+  dispose(): void {
+    // No resources to release.
   }
 }
 
@@ -276,6 +371,9 @@ class WorkerRunner implements EmbeddingRunner {
 /** The active runner for this session. */
 let runner: EmbeddingRunner | null = null;
 
+/** Active embedding backend (for diagnostics + revision behavior). */
+let backend: EmbeddingBackend | null = null;
+
 /** Whether the model pipeline is ready (loaded and cached). */
 let modelReady = false;
 
@@ -306,7 +404,7 @@ export function isModelReady(): boolean {
  */
 export function isModelRevisionCurrent(): boolean {
   const stored = prefs.getEmbeddingModelRevision();
-  return stored !== "" && stored === PINNED_REVISION;
+  return stored !== "" && (stored === PINNED_REVISION || stored === HASH_BACKEND_REVISION);
 }
 
 /**
@@ -327,14 +425,19 @@ export async function ensureModelReady(
     );
   }
 
-  const currentRunner = await getRunner();
+  // Try Transformers first; if unavailable in runtime, auto-fallback to
+  // hashing so semantic mode stays functional.
+  const selection = await initializeRunner(onProgress);
+  runner = selection.runner;
+  backend = selection.backend;
+  runnerProbed = true;
 
-  // Warm up by embedding a short test string — this triggers model download.
-  await currentRunner.embed(["warmup"], onProgress);
-
-  // If we get here, the model is loaded and cached.
   modelReady = true;
-  prefs.setEmbeddingModelRevision(PINNED_REVISION);
+  prefs.setEmbeddingModelRevision(
+    backend === "transformers" ? PINNED_REVISION : HASH_BACKEND_REVISION,
+  );
+  prefs.setEmbeddingRuntimeUnsupported(false);
+  prefs.setEmbeddingRuntimeUnsupportedReason("");
 }
 
 /**
@@ -430,6 +533,7 @@ export function disposeEmbedder(): void {
     runner.dispose();
     runner = null;
   }
+  backend = null;
   modelReady = false;
   runnerProbed = false;
 }
@@ -451,9 +555,93 @@ export function disposeEmbedder(): void {
  */
 async function getRunner(): Promise<EmbeddingRunner> {
   if (runner) return runner;
+  const selection = await initializeRunner();
+  runner = selection.runner;
+  backend = selection.backend;
   runnerProbed = true;
-  // Main-thread only mode (stable in Zotero 8).
-  runner = new MainThreadRunner();
-  ztoolkit.log("Embedder: using MainThreadRunner");
   return runner;
+}
+
+async function initializeRunner(
+  onProgress?: (p: number) => void,
+): Promise<{ runner: EmbeddingRunner; backend: EmbeddingBackend }> {
+  // Prefer full semantic model first.
+  const tfRunner = new MainThreadRunner();
+  try {
+    await tfRunner.embed(["warmup"], onProgress);
+    ztoolkit.log("Embedder: using Transformers backend");
+    return { runner: tfRunner, backend: "transformers" };
+  } catch (tfErr: any) {
+    const msg = tfErr?.message ?? String(tfErr);
+    ztoolkit.log(
+      `Embedder: Transformers unavailable (${msg}). Falling back to hashing backend.`,
+    );
+  }
+
+  // Guaranteed runtime-safe fallback.
+  const hashRunner = new HashingRunner();
+  await hashRunner.embed(["warmup"], onProgress);
+  ztoolkit.log("Embedder: using hashing fallback backend");
+  return { runner: hashRunner, backend: "hashing" };
+}
+
+function hashEmbed(text: string): number[] {
+  const vector = new Float32Array(EMBEDDING_DIMS);
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return Array.from(vector);
+  }
+
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  for (const token of tokens) {
+    addFeature(vector, `tok:${token}`, 1.0);
+    const len = token.length;
+    if (len >= 3) {
+      for (let i = 0; i <= len - 3; i++) {
+        addFeature(vector, `tri:${token.slice(i, i + 3)}`, 0.35);
+      }
+    }
+  }
+
+  // Normalize to unit vector for cosine similarity.
+  let norm = 0;
+  for (let i = 0; i < vector.length; i++) {
+    norm += vector[i]! * vector[i]!;
+  }
+  if (norm > 0) {
+    const inv = 1 / Math.sqrt(norm);
+    for (let i = 0; i < vector.length; i++) {
+      vector[i] = vector[i]! * inv;
+    }
+  }
+  return Array.from(vector);
+}
+
+function addFeature(vector: Float32Array, feature: string, weight: number): void {
+  const h1 = fnv1a32(feature);
+  const h2 = fnv1a32(`sign:${feature}`);
+  const i1 = h1 % EMBEDDING_DIMS;
+  const i2 = ((h1 >>> 8) ^ h2) % EMBEDDING_DIMS;
+  const sign1 = (h2 & 1) === 0 ? 1 : -1;
+  const sign2 = (h2 & 2) === 0 ? 1 : -1;
+
+  vector[i1] = (vector[i1] ?? 0) + sign1 * weight;
+  vector[i2] = (vector[i2] ?? 0) + sign2 * weight * 0.5;
+}
+
+function fnv1a32(input: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function normalizeText(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }

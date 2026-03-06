@@ -179,16 +179,30 @@ export async function checkPrivacy(
     return "Cloud sharing is disabled. Enable it in Settings or switch to Ollama (local).";
   }
 
-  // Per-item privacy check. If IndexedDB is unavailable in this context
-  // (e.g. some XUL panel environments), we skip the per-item flag and
-  // fall through to "allowed". The global cloud-sharing toggle above
-  // already gates cloud access; per-item flags are a secondary opt-out.
+  // Per-item privacy check. Uses OR logic across both stores: block if
+  // EITHER IndexedDB or the Zotero.Prefs mirror says the item is private.
+  //
+  // Why OR instead of primary/fallback: the write path in privacyToggle.ts
+  // writes Prefs first (always succeeds) then IDB (best-effort). If IDB
+  // write fails but IDB remains readable with stale data, checking only IDB
+  // would miss the user's latest privacy intent stored in Prefs.
+  //
+  // If IndexedDB is entirely unavailable (throws), we still check Prefs.
+  const PRIVATE_MSG =
+    "This paper is marked as private. Its content cannot be sent to cloud LLMs.";
+
+  // Check Prefs mirror (synchronous, always available).
+  if (prefs.isItemPrivatePref(itemId)) {
+    return PRIVATE_MSG;
+  }
+
+  // Check IndexedDB (may throw in reader panel context).
   try {
     if (await isItemPrivate(itemId)) {
-      return "This paper is marked as private. Its content cannot be sent to cloud LLMs.";
+      return PRIVATE_MSG;
     }
   } catch {
-    // IndexedDB unavailable — cannot read per-item flag, default to allowed.
+    // IndexedDB unavailable — Prefs mirror already checked above; no further action.
   }
 
   return null;
@@ -247,11 +261,6 @@ export function buildMessages(
     messages.push({
       role: "user",
       content: `<document>\n${paperContext}\n</document>`,
-    });
-    messages.push({
-      role: "assistant",
-      content:
-        "I have read the paper content. What would you like to know about it?",
     });
   }
 

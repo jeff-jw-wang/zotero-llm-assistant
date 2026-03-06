@@ -44,6 +44,7 @@ import {
   checkPrivacy,
   getChatOptions,
 } from "../llm/client";
+import { OllamaProvider } from "../llm/providers/ollama";
 import {
   appendMessage as dbAppendMessage,
   getConversation,
@@ -54,6 +55,8 @@ import * as prefs from "../../prefs";
 
 /** Timeout boundary for non-critical DB calls in UI code paths. */
 const DB_OP_TIMEOUT_MS = 2_000;
+const OLLAMA_STATUS_NOTE_ID = "llm-ollama-status-note";
+const MAX_CONTEXT_HISTORY_MESSAGES = 6;
 
 // ---------------------------------------------------------------------------
 // Panel registration
@@ -156,20 +159,37 @@ function renderChatUI(
 ): void {
   container.innerHTML = "";
 
-  // Privacy toggle in header
+  // Privacy toggle in header.
+  // renderPrivacyToggle is async (IndexedDB read) — catch rejections to avoid
+  // unhandled promise rejections in the UI render path. The toggle gracefully
+  // degrades via its internal Prefs mirror fallback, but we still guard the
+  // outer call site in case of unexpected errors (e.g. DOM not ready).
   const privacyEl = container
     .closest("#llm-root")
     ?.querySelector<HTMLElement>("#llm-privacy-toggle");
   if (privacyEl) {
-    renderPrivacyToggle(privacyEl, doc, item.id);
+    renderPrivacyToggle(privacyEl, doc, item.id).catch((err) => {
+      ztoolkit.log("renderPrivacyToggle() failed:", (err as Error)?.message ?? err);
+    });
   }
 
-  // Provider selector in header
+  // Provider selector in header — when the user switches provider, re-render
+  // the privacy toggle so it shows the updated provider name (e.g. "☁ Ollama").
   const providerEl = container
     .closest("#llm-root")
     ?.querySelector<HTMLElement>("#llm-provider-select");
   if (providerEl) {
-    renderProviderSelector(providerEl, doc);
+    renderProviderSelector(providerEl, doc, () => {
+      if (privacyEl) {
+        renderPrivacyToggle(privacyEl, doc, item.id).catch((err) => {
+          ztoolkit.log(
+            "renderPrivacyToggle() after provider change failed:",
+            (err as Error)?.message ?? err,
+          );
+        });
+      }
+      void notifyOllamaIfUnavailable(messages, doc);
+    });
   }
 
   // Message list
@@ -201,6 +221,9 @@ function renderChatUI(
     "display:flex;flex-direction:column;height:100%;overflow:hidden;";
   container.appendChild(messages);
   container.appendChild(inputBar);
+
+  // If Ollama is selected, proactively show setup guidance when unreachable.
+  void notifyOllamaIfUnavailable(messages, doc);
 
   // Load conversation history (non-blocking — DB failures degrade to empty state).
   withTimeout(
@@ -326,6 +349,16 @@ async function handleQuestion(
     return;
   }
 
+  // Local provider setup check: if Ollama is selected but unreachable,
+  // show explicit install/start guidance instead of generic transport errors.
+  if (prefs.getActiveProvider() === "ollama") {
+    const available = await provider.isAvailable();
+    if (!available) {
+      appendOllamaSetupGuidance(messages, doc);
+      return;
+    }
+  }
+
   // --- Privacy check ---
   const privacyBlock = await checkPrivacy(provider, item.id);
   if (privacyBlock) {
@@ -339,6 +372,7 @@ async function handleQuestion(
 
   let fullResponse = "";
   let pipeline;
+  let usedStream = true; // Flipped to false if streaming fails and we fall back to chat().
 
   try {
     // Build conversation history for the pipeline.
@@ -357,6 +391,7 @@ async function handleQuestion(
       history = (record?.messages ?? [])
         .filter((m) => m.role !== "system")
         .slice(0, -1) // exclude the just-saved current question
+        .slice(-MAX_CONTEXT_HISTORY_MESSAGES) // keep recent turns to preserve RAG context budget
         .map((m) => ({
           role: m.role as "user" | "assistant",
           content: m.content,
@@ -416,10 +451,12 @@ async function handleQuestion(
         throw streamErr;
       }
 
-      // Some environments/proxies break SSE but allow non-stream requests.
-      updateStatusNote(
-        statusNote,
-        `Streaming failed. Retrying ${provider.name} without streaming\u2026`,
+      // Silent non-stream fallback — keep the existing "Connecting…" status note
+      // so the user sees no error flash. The diagnostics footer will show "non-stream".
+      usedStream = false;
+      ztoolkit.log(
+        "chatStream() failed; retrying without streaming:",
+        (streamErr as Error)?.message ?? streamErr,
       );
       const nonStreamText = await provider.chat(pipeline.messages, {
         ...options,
@@ -477,11 +514,15 @@ async function handleQuestion(
     ztoolkit.log("Failed to save assistant message to DB:", dbErr?.message ?? dbErr);
   });
 
-  // D7: Token usage indicator.
+  // D7: Diagnostics footer — model · host · mode · tokens.
   const totalTokens =
     estimateTokens(pipeline.messages.map((m) => m.content).join("")) +
     estimateTokens(fullResponse);
-  appendSystemNote(messages, doc, `~${totalTokens.toLocaleString()} tokens used`);
+  appendSystemNote(
+    messages,
+    doc,
+    buildDiagnosticsNote(options.model, usedStream, totalTokens),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -672,7 +713,11 @@ const PROVIDER_OPTIONS: Array<{
  * Each option shows "Provider (model)" so the user can see both at a glance.
  * Changing the selection updates the active provider pref immediately.
  */
-function renderProviderSelector(container: HTMLElement, doc: Document): void {
+function renderProviderSelector(
+  container: HTMLElement,
+  doc: Document,
+  onProviderChange?: () => void,
+): void {
   container.innerHTML = "";
 
   const select = h(doc, "select") as HTMLSelectElement;
@@ -695,6 +740,7 @@ function renderProviderSelector(container: HTMLElement, doc: Document): void {
 
   select.addEventListener("change", () => {
     prefs.setActiveProvider(select.value as prefs.ProviderName);
+    onProviderChange?.();
   });
 
   container.appendChild(select);
@@ -735,6 +781,63 @@ function appendSystemNote(
     "font-size:11px;color:#999;text-align:center;padding:4px 8px;";
   note.textContent = `\u2139 ${text}`;
   container.appendChild(note);
+}
+
+/**
+ * Appends concrete setup steps for Ollama when it is selected but unreachable.
+ */
+function appendOllamaSetupGuidance(
+  container: HTMLElement,
+  doc: Document,
+): void {
+  const endpoint = prefs.getOllamaEndpoint();
+  const model = prefs.getOllamaModel();
+  appendBubble(
+    container,
+    doc,
+    "assistant",
+    "Ollama is selected but not reachable.\n" +
+      `• Endpoint: ${endpoint}\n` +
+      "• Install Ollama: https://ollama.com/download\n" +
+      "• Start server: ollama serve\n" +
+      `• Pull model: ollama pull ${model}`,
+  );
+}
+
+/**
+ * Emits a one-time info note when Ollama is selected and currently unavailable.
+ */
+async function notifyOllamaIfUnavailable(
+  messages: HTMLElement,
+  doc: Document,
+): Promise<void> {
+  const existing = messages.querySelector<HTMLElement>(`#${OLLAMA_STATUS_NOTE_ID}`);
+
+  if (prefs.getActiveProvider() !== "ollama") {
+    existing?.remove();
+    return;
+  }
+
+  const provider = new OllamaProvider(prefs.getOllamaEndpoint());
+  const available = await provider.isAvailable();
+  if (available) {
+    existing?.remove();
+    return;
+  }
+
+  const text =
+    "\u2139 Ollama not detected. Install Ollama: https://ollama.com/download, then run `ollama serve`.";
+  if (existing) {
+    existing.textContent = text;
+    return;
+  }
+
+  const note = h(doc, "div");
+  note.id = OLLAMA_STATUS_NOTE_ID;
+  note.style.cssText =
+    "font-size:11px;color:#999;text-align:center;padding:4px 8px;";
+  note.textContent = text;
+  messages.appendChild(note);
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +909,61 @@ function shouldRetryNonStream(err: any): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the diagnostics footer string appended after each LLM response.
+ *
+ * Format: `{model} · {host} · {mode} · ~{tokens} tokens`
+ * Example: `gpt-4o-mini · api.openai.com · stream · ~4,231 tokens`
+ *
+ * Redaction rules (ROADMAP §diagnostics):
+ *   - Only the hostname is shown — no path, no query parameters, no port.
+ *   - API keys and Authorization headers are never present in the host string.
+ *   - The formatter is the sole owner of redaction; callers pass raw values.
+ */
+function buildDiagnosticsNote(
+  model: string,
+  usedStream: boolean,
+  tokens: number,
+): string {
+  const host = getProviderDisplayHost();
+  const mode = usedStream ? "stream" : "non-stream";
+  return `${model} \u00b7 ${host} \u00b7 ${mode} \u00b7 ~${tokens.toLocaleString()} tokens`;
+}
+
+/**
+ * Returns a safe display hostname for the currently active provider.
+ * Only the `host` portion of the endpoint URL is returned (no path, query, or auth).
+ * Falls back to the provider name string if URL parsing fails.
+ */
+function getProviderDisplayHost(): string {
+  const name = prefs.getActiveProvider();
+  try {
+    switch (name) {
+      case "ollama":
+        return new URL(prefs.getOllamaEndpoint()).host;
+      case "gemini":
+        return "generativelanguage.googleapis.com";
+      case "openai":
+        return new URL(prefs.getOpenAIEndpoint()).host;
+      case "anthropic":
+        return "api.anthropic.com";
+      case "custom": {
+        const ep = prefs.getCustomEndpoint();
+        return ep ? new URL(ep).host : "custom";
+      }
+      default:
+        return name;
+    }
+  } catch {
+    // URL parsing failed (e.g. malformed endpoint pref) — degrade gracefully.
+    return name;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Error message helper
 // ---------------------------------------------------------------------------
 
@@ -818,7 +976,7 @@ function friendlyErrorMessage(err: any): string {
   const activeProvider = prefs.getActiveProvider();
   const providerHint =
     activeProvider === "ollama"
-      ? "If using Ollama, make sure it’s running (ollama serve)."
+      ? "If using Ollama, make sure it’s installed and running (ollama serve). Install: https://ollama.com/download"
       : `Check your ${activeProvider} API key/endpoint and network access.`;
 
   // AbortError: the connection timed out (our AbortController fired).
@@ -845,6 +1003,15 @@ function friendlyErrorMessage(err: any): string {
       "Request timed out. The LLM provider did not respond in time.\n" +
       `\u2022 ${providerHint}\n` +
       "\u2022 The network or provider endpoint may be blocking long-running streams."
+    );
+  }
+
+  // Rate limit / quota exceeded (safety net — providers should format this themselves).
+  if (/429|quota exceeded|rate.?limit/i.test(raw)) {
+    return (
+      "API rate limit or quota exceeded.\n" +
+      "\u2022 Wait a few minutes and try again.\n" +
+      "\u2022 Consider switching to a different provider in Settings."
     );
   }
 

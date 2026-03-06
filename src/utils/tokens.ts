@@ -21,16 +21,26 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-/** Maximum usable tokens per provider model (input context budget). */
+/** Maximum usable tokens per provider model (input context budget).
+ *
+ * Caps are conservative — well below the hard API limits — to:
+ *   - Stay under free-tier quota for Gemini (60 req/min, 1M tokens/min)
+ *   - Control cost for paid providers (OpenAI, Anthropic)
+ *   - Give Ollama enough context without hitting VRAM limits
+ *
+ * Free Gemini note (#10): each full-paper request at 64K tokens quickly
+ * exhausts the per-minute quota. Cap at 16K (≈ 31 chunks of ~512 tokens)
+ * so even rapid back-and-forth stays under the free limit.
+ */
 export const MODEL_TOKEN_CAPS: Record<string, number> = {
-  // OpenAI
-  "gpt-4o-mini": 32_000,   // conservative; actual 128K but large PDFs get expensive
+  // OpenAI (128K context; 32K cap controls cost on paid API)
+  "gpt-4o-mini": 32_000,
   "gpt-4o": 32_000,
-  // Gemini
-  "gemini-2.0-flash": 64_000,
-  "gemini-1.5-flash": 64_000,
-  "gemini-1.5-pro": 64_000,
-  // Anthropic
+  // Gemini (1M context; 16K cap to stay under free-tier per-minute quota)
+  "gemini-2.0-flash": 16_000,
+  "gemini-1.5-flash": 16_000,
+  "gemini-1.5-pro": 16_000,
+  // Anthropic (200K context; 32K cap controls cost on paid API)
   "claude-sonnet-4-6": 32_000,
   "claude-haiku-4-5-20251001": 32_000,
 };
@@ -41,6 +51,30 @@ const DEFAULT_TOKEN_CAP = 8_000;
 /** Returns the token cap for a given model identifier. */
 export function getTokenCap(model: string): number {
   return MODEL_TOKEN_CAPS[model] ?? DEFAULT_TOKEN_CAP;
+}
+
+/**
+ * Average chunk size in tokens — used for dynamic topK calculation.
+ * Each chunk targets ~512 tokens; this constant matches chunker.ts TARGET_TOKENS.
+ */
+export const AVG_CHUNK_TOKENS = 512;
+
+/**
+ * Returns the maximum number of chunks to select for a given model.
+ *
+ * Dynamic topK = floor(contextBudget / avgChunkTokens).
+ * Caps the NUMBER of chunks in addition to the token budget, preventing the
+ * LLM from receiving a flood of tiny chunks that individually fit in the budget
+ * but together overwhelm the prompt structure. Minimum 1 to always include
+ * at least one chunk.
+ *
+ * @example
+ *   getTopKCap("gemini-2.0-flash")  // floor(16000/512) = 31
+ *   getTopKCap("gpt-4o-mini")       // floor(32000/512) = 62
+ *   getTopKCap("llama3.2")          // floor(8000/512)  = 15
+ */
+export function getTopKCap(model: string): number {
+  return Math.max(1, Math.floor(getTokenCap(model) / AVG_CHUNK_TOKENS));
 }
 
 /**

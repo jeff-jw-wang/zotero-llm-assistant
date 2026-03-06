@@ -5,6 +5,10 @@ pref-model-label = Model
 pref-endpoint-label = Endpoint URL
 
 pref-ollama-hint = Ollama runs locally — no data leaves your machine. Install from ollama.com.
+pref-ollama-check =
+    .label = Check Ollama
+pref-ollama-install =
+    .label = Install Ollama
 pref-gemini-hint = Free with a Google account — no credit card required. Get a key at aistudio.google.com.
 pref-openai-hint = Use the default endpoint for api.openai.com, or enter a compatible base URL.
 pref-anthropic-hint = Requires an Anthropic API key from console.anthropic.com.

@@ -30,7 +30,7 @@
 import { extractPDF } from "./extractor";
 import { chunkPages, type Chunk } from "./chunker";
 import { buildMessages } from "../llm/client";
-import { getTokenCap } from "../../utils/tokens";
+import { getTokenCap, getTopKCap } from "../../utils/tokens";
 import type { LLMMessage } from "../llm/types";
 import {
   isModelReady,
@@ -202,9 +202,10 @@ export async function buildRAGContext(
 
   const scored = scoreChunks(chunks, question, chunkEmbeddings, questionEmbedding);
 
-  // --- Step 4: Select within token budget ---
+  // --- Step 4: Select within token budget + dynamic topK cap ---
   const tokenCap = getTokenCap(model);
-  const selected = selectChunks(scored, tokenCap);
+  const maxChunks = getTopKCap(model); // Caps chunk COUNT independent of token budget.
+  const selected = selectChunks(scored, tokenCap, maxChunks);
 
   // --- Step 5: Build context string + whitelist ---
   // Re-sort selected chunks by page order for coherent reading.
@@ -337,27 +338,40 @@ function scoreChunks(
 // ---------------------------------------------------------------------------
 
 /**
- * Greedily selects top-scoring chunks within the token budget.
+ * Greedily selects top-scoring chunks within the token budget and chunk count cap.
+ *
+ * Two constraints are applied:
+ *   1. Token budget (maxTokens): total chars ≤ maxTokens × 4
+ *   2. Dynamic topK (maxChunks): number of chunks ≤ maxChunks
+ *
  * If no chunks fit, truncates the highest-scoring chunk to the budget.
+ *
+ * @param maxChunks - Optional maximum chunk count (dynamic topK from getTopKCap()).
  */
-function selectChunks(scored: ScoredChunk[], maxTokens: number): Chunk[] {
-  // Sort by score descending.
+function selectChunks(
+  scored: ScoredChunk[],
+  maxTokens: number,
+  maxChunks?: number,
+): Chunk[] {
+  // Sort by score descending; apply topK cap before budget fill.
   const sorted = [...scored].sort((a, b) => b.score - a.score);
+  const candidates = maxChunks !== undefined ? sorted.slice(0, maxChunks) : sorted;
 
   const budget = maxTokens * CHARS_PER_TOKEN;
   const selected: Chunk[] = [];
   let usedChars = 0;
 
-  for (const chunk of sorted) {
+  for (const chunk of candidates) {
     const chunkChars = chunk.text.length + MARKER_OVERHEAD;
     if (usedChars + chunkChars > budget) continue;
     selected.push(chunk);
     usedChars += chunkChars;
   }
 
-  // Guard: always include at least one chunk, truncated if necessary.
-  if (selected.length === 0 && sorted.length > 0) {
-    const top = sorted[0]!;
+  // Guard: always include at least one chunk (truncated to budget), so the
+  // user gets some context even when a single chunk exceeds the token cap.
+  if (selected.length === 0 && candidates.length > 0) {
+    const top = candidates[0]!;
     const maxChars = Math.max(budget - MARKER_OVERHEAD, 100);
     selected.push({
       id: top.id,
