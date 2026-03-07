@@ -1,7 +1,7 @@
 {
   "name": "zotero-llm-assistant",
   "type": "module",
-  "version": "0.1.1",
+  "version": "0.1.1b",
   "description": "AI-powered research assistant for Zotero — chat with papers, search your library, and jump to cited pages.",
   "config": {
     "addonName": "Zotero LLM Assistant",
