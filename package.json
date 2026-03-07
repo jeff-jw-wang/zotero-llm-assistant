@@ -26,6 +26,7 @@
     "test:privacy": "tsx test/privacy-fallback.test.ts",
     "test:privacy-mismatch": "tsx test/privacy-mismatch.test.ts",
     "test:qa-fixes": "tsx test/qa-fixes.test.ts",
+    "test:v0.1.1b": "tsx test/v0.1.1b.test.ts",
     "release": "zotero-plugin release"
   },
   "dependencies": {
