@@ -79,15 +79,15 @@ export function registerReaderPanel(): void {
       icon: `chrome://${config.addonRef}/content/icons/favicon@0.5x.png`,
     },
     bodyXHTML: `
-      <html:div id="llm-root" style="display:flex;flex-direction:column;height:100%;font-family:system-ui,sans-serif;font-size:13px;">
-        <html:div id="llm-header" style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid #ddd;min-height:26px;">
+      <html:div id="llm-root" style="display:flex;flex-direction:column;height:400px;min-height:200px;max-height:800px;resize:vertical;overflow:hidden;font-family:system-ui,sans-serif;font-size:13px;">
+        <html:div id="llm-header" style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid #ddd;min-height:26px;flex-shrink:0;">
           <html:span style="font-weight:600;color:#333;">LLM Assistant</html:span>
           <html:div style="display:flex;align-items:center;gap:6px;">
             <html:div id="llm-provider-select"></html:div>
             <html:div id="llm-privacy-toggle"></html:div>
           </html:div>
         </html:div>
-        <html:div id="llm-body" style="flex:1;overflow:hidden;display:flex;flex-direction:column;"></html:div>
+        <html:div id="llm-body" style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;"></html:div>
       </html:div>
     `,
     onInit: ({ body, item }) => {
@@ -152,18 +152,18 @@ function renderPanel(body: HTMLElement, item: Zotero.Item): void {
 // Chat UI
 // ---------------------------------------------------------------------------
 
+const RENDERED_ATTR = "data-rendered-item-id";
+
 function renderChatUI(
   container: HTMLElement,
   doc: Document,
   item: Zotero.Item,
 ): void {
-  container.innerHTML = "";
-
-  // Privacy toggle in header.
-  // renderPrivacyToggle is async (IndexedDB read) — catch rejections to avoid
-  // unhandled promise rejections in the UI render path. The toggle gracefully
-  // degrades via its internal Prefs mirror fallback, but we still guard the
-  // outer call site in case of unexpected errors (e.g. DOM not ready).
+  // -----------------------------------------------------------------------
+  // Phase 1: Header refresh — ALWAYS runs for provider/privacy state.
+  // This ensures the provider selector and privacy toggle stay current even
+  // on guarded same-item rerenders (e.g. tab switch back to same PDF).
+  // -----------------------------------------------------------------------
   const privacyEl = container
     .closest("#llm-root")
     ?.querySelector<HTMLElement>("#llm-privacy-toggle");
@@ -173,8 +173,6 @@ function renderChatUI(
     });
   }
 
-  // Provider selector in header — when the user switches provider, re-render
-  // the privacy toggle so it shows the updated provider name (e.g. "☁ Ollama").
   const providerEl = container
     .closest("#llm-root")
     ?.querySelector<HTMLElement>("#llm-provider-select");
@@ -188,26 +186,58 @@ function renderChatUI(
           );
         });
       }
-      void notifyOllamaIfUnavailable(messages, doc);
+      // Resolve messages container from DOM at call time — NOT from a closure
+      // over the late-declared `messages` variable. This is safe on guarded
+      // rerenders because #llm-messages already exists from the prior render.
+      const liveMessages = container.querySelector<HTMLElement>("#llm-messages");
+      if (liveMessages) {
+        void notifyOllamaIfUnavailable(liveMessages, doc);
+      }
     });
   }
+
+  // -----------------------------------------------------------------------
+  // Phase 2: Chat body init — skip if same item already rendered.
+  // Only the destructive container.innerHTML="" + message rebuild is guarded.
+  // -----------------------------------------------------------------------
+  if (container.getAttribute(RENDERED_ATTR) === String(item.id) && container.hasChildNodes()) {
+    return; // Messages, input bar, scroll position all preserved
+  }
+  container.setAttribute(RENDERED_ATTR, String(item.id));
+  container.innerHTML = "";
 
   // Message list
   const messages = h(doc,"div");
   messages.id = "llm-messages";
   messages.style.cssText =
-    "flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:4px;";
+    "flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:4px;" +
+    "user-select:text;-moz-user-select:text;";
 
   // Input bar
   const inputBar = h(doc,"div");
   inputBar.style.cssText =
     "display:flex;padding:6px;border-top:1px solid #ddd;gap:4px;flex-shrink:0;";
 
-  const input = h(doc,"input") as HTMLInputElement;
-  input.type = "text";
-  input.placeholder = "Ask about this paper…";
+  const input = h(doc,"textarea") as HTMLTextAreaElement;
+  (input as any).rows = 1;
+  input.placeholder = "Ask about this paper\u2026";
   input.style.cssText =
-    "flex:1;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;";
+    "flex:1;padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;" +
+    "resize:none;overflow-y:hidden;line-height:1.4;font-family:inherit;";
+
+  // Auto-resize textarea up to ~5 rows, then show internal scrollbar.
+  const TEXTAREA_MAX_HEIGHT = 103; // ~5 rows: 13px * 1.4 * 5 + 12px padding
+  const autoResizeInput = () => {
+    input.style.height = "auto";
+    input.style.overflowY = "hidden";
+    if (input.scrollHeight > TEXTAREA_MAX_HEIGHT) {
+      input.style.height = TEXTAREA_MAX_HEIGHT + "px";
+      input.style.overflowY = "auto";
+    } else {
+      input.style.height = input.scrollHeight + "px";
+    }
+  };
+  input.addEventListener("input", autoResizeInput);
 
   const sendBtn = h(doc,"button") as HTMLButtonElement;
   sendBtn.textContent = "Send";
@@ -218,7 +248,7 @@ function renderChatUI(
   inputBar.appendChild(sendBtn);
 
   container.style.cssText =
-    "display:flex;flex-direction:column;height:100%;overflow:hidden;";
+    "display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;";
   container.appendChild(messages);
   container.appendChild(inputBar);
 
@@ -256,11 +286,12 @@ function renderChatUI(
             }
           }
           renderResponseWithCitations(bubble, doc, msg.content, whitelist, item);
+          appendCopyButton(bubble, doc, () => msg.content);
         } else {
           appendBubble(messages, doc, "user", msg.content);
         }
       }
-      messages.scrollTop = messages.scrollHeight;
+      scrollToBottom(messages); // force — just loaded history
     } else {
       const placeholder = h(doc,"p");
       placeholder.style.cssText =
@@ -284,6 +315,7 @@ function renderChatUI(
     if (!question || sendBtn.disabled) return;
 
     input.value = "";
+    input.style.height = "auto"; // reset textarea to 1 row
     sendBtn.disabled = true;
     sendBtn.textContent = "…";
 
@@ -291,8 +323,15 @@ function renderChatUI(
     const placeholder = messages.querySelector("p");
     if (placeholder) placeholder.remove();
 
+    // Capture sticky-scroll state BEFORE appending the user bubble.
+    // This mutable object is threaded through handleQuestion so the
+    // finally block and all intermediate scrolls honor the user's
+    // scroll position at send time. The streaming loop updates .stick
+    // before each chunk in case the user scrolls back down mid-stream.
+    const scrollState = { stick: isNearBottom(messages) };
+
     appendBubble(messages, doc, "user", question);
-    messages.scrollTop = messages.scrollHeight;
+    scrollToBottom(messages, scrollState.stick);
 
     try {
       // Fire-and-forget: persistence must never block question handling.
@@ -308,20 +347,25 @@ function renderChatUI(
         ztoolkit.log("Failed to save user message to DB:", dbErr?.message ?? dbErr);
       });
 
-      await handleQuestion(question, item, messages, doc);
+      await handleQuestion(question, item, messages, doc, scrollState);
     } catch (err: any) {
       const msg = friendlyErrorMessage(err);
       appendBubble(messages, doc, "assistant", `⚠ ${msg}`);
     } finally {
       sendBtn.disabled = false;
       sendBtn.textContent = "Send";
-      messages.scrollTop = messages.scrollHeight;
+      scrollToBottom(messages, scrollState.stick);
     }
   };
 
   sendBtn.addEventListener("click", handleSend);
+  // Ctrl+Enter (Cmd+Enter on Mac) sends; plain Enter inserts newline.
   input.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") handleSend();
+    const ke = e as KeyboardEvent;
+    if (ke.key === "Enter" && (ke.ctrlKey || ke.metaKey)) {
+      ke.preventDefault();
+      handleSend();
+    }
   });
 }
 
@@ -334,6 +378,7 @@ async function handleQuestion(
   item: Zotero.Item,
   messages: HTMLElement,
   doc: Document,
+  scrollState: { stick: boolean },
 ): Promise<void> {
   // --- Create provider ---
   let provider;
@@ -367,7 +412,7 @@ async function handleQuestion(
   }
 
   // --- Build RAG context via pipeline ---
-  const statusNote = appendStatusNote(messages, doc, "Extracting and analysing paper\u2026");
+  const statusNote = appendStatusNote(messages, doc, "Extracting and analysing paper\u2026", scrollState.stick);
   const options = getChatOptions();
 
   let fullResponse = "";
@@ -402,13 +447,21 @@ async function handleQuestion(
 
     pipeline = await buildRAGContext(item, question, history, options.model);
 
-    // Show system note about chunk selection.
+    // Refresh sticky-scroll after the big async gap (PDF extraction + chunking
+    // can take seconds). The user may have scrolled up during the wait.
+    scrollState.stick = isNearBottom(messages);
+
+    // Show system note about chunk selection — pass scrollState.stick so the
+    // note scrolls into view when the user was at the bottom. Without this,
+    // the note's DOM insertion can push the user past the isNearBottom threshold
+    // and the subsequent re-check would falsely read "not near bottom".
     if (pipeline.stats.totalChunks > 0) {
       if (pipeline.stats.selectedChunks < pipeline.stats.totalChunks) {
         appendSystemNote(
           messages,
           doc,
           `Paper: ${pipeline.stats.totalPages} pages, ${pipeline.stats.totalChunks} chunks. Showing ${pipeline.stats.selectedChunks} most relevant.`,
+          scrollState.stick,
         );
       }
     } else {
@@ -416,16 +469,21 @@ async function handleQuestion(
         messages,
         doc,
         "PDF text could not be extracted. Answering from model knowledge only.",
+        scrollState.stick,
       );
     }
 
     // --- Stream response (with non-stream fallback if SSE fails) ---
     updateStatusNote(statusNote, `Connecting to ${provider.name}\u2026`);
 
+    // Refresh sticky-scroll one more time — the user may have scrolled
+    // during the system-note rendering or status-note update.
+    scrollState.stick = isNearBottom(messages);
+
     const assistantBubble = h(doc,"div");
     assistantBubble.style.cssText = BUBBLE_STYLE_ASSISTANT;
     messages.appendChild(assistantBubble);
-    messages.scrollTop = messages.scrollHeight;
+    scrollToBottom(messages, scrollState.stick);
 
     let firstChunk = true;
 
@@ -436,6 +494,8 @@ async function handleQuestion(
           firstChunk = false;
         }
         fullResponse += chunk.text;
+        // Re-check scroll position BEFORE DOM mutation (each chunk may change height).
+        scrollState.stick = isNearBottom(messages);
         renderResponseWithCitations(
           assistantBubble,
           doc,
@@ -443,7 +503,7 @@ async function handleQuestion(
           pipeline.chunkWhitelist,
           item,
         );
-        messages.scrollTop = messages.scrollHeight;
+        scrollToBottom(messages, scrollState.stick);
         if (chunk.done) break;
       }
     } catch (streamErr: any) {
@@ -463,6 +523,7 @@ async function handleQuestion(
         stream: false,
       });
       fullResponse = nonStreamText ?? "";
+      scrollState.stick = isNearBottom(messages);
       renderResponseWithCitations(
         assistantBubble,
         doc,
@@ -470,7 +531,7 @@ async function handleQuestion(
         pipeline.chunkWhitelist,
         item,
       );
-      messages.scrollTop = messages.scrollHeight;
+      scrollToBottom(messages, scrollState.stick);
       removeStatusNote(statusNote);
       firstChunk = false;
     }
@@ -479,6 +540,12 @@ async function handleQuestion(
     // the status note is still visible — clean it up now.
     if (firstChunk) {
       removeStatusNote(statusNote);
+    }
+
+    // Add copy button AFTER streaming completes — not during, because
+    // renderResponseWithCitations() does bubble.innerHTML="" on each call.
+    if (fullResponse) {
+      appendCopyButton(assistantBubble, doc, () => fullResponse);
     }
   } catch (err) {
     // Clean up the status note before re-throwing — the caller renders the error.
@@ -522,6 +589,7 @@ async function handleQuestion(
     messages,
     doc,
     buildDiagnosticsNote(options.model, usedStream, totalTokens),
+    scrollState.stick,
   );
 }
 
@@ -750,13 +818,49 @@ function renderProviderSelector(
 // DOM helpers
 // ---------------------------------------------------------------------------
 
+// --- Scroll helpers (Fix #6) ------------------------------------------------
+
+const SCROLL_NEAR_BOTTOM_PX = 40;
+
+/**
+ * Returns `true` when the element is scrolled to within `SCROLL_NEAR_BOTTOM_PX`
+ * of its maximum scroll position. **Must** be called BEFORE the DOM mutation
+ * that appends new content — otherwise the newly-added height may push the
+ * measurement past the threshold and yield a false negative.
+ */
+export function isNearBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_NEAR_BOTTOM_PX;
+}
+
+/**
+ * Scrolls an element to the bottom using `requestAnimationFrame` for smooth
+ * visual timing. The `shouldStick` parameter carries the result of an
+ * `isNearBottom()` check captured **before** the DOM mutation that added new
+ * content.
+ *
+ * - `shouldStick === false` → user has scrolled up; skip auto-scroll.
+ * - `shouldStick === true`  → user is near the bottom; scroll.
+ * - `shouldStick` omitted   → unconditional force-scroll (e.g. after loading
+ *    history or after the user explicitly sends a new message).
+ */
+export function scrollToBottom(el: HTMLElement, shouldStick?: boolean): void {
+  if (shouldStick === false) return; // user scrolled up — don't auto-scroll
+  (el.ownerDocument!.defaultView ?? (globalThis as any)).requestAnimationFrame(() => {
+    el.scrollTop = el.scrollHeight;
+  });
+}
+
+// --- Bubble styles ----------------------------------------------------------
+
 const BUBBLE_STYLE_USER =
   "padding:8px 12px;border-radius:12px 12px 2px 12px;background:#e3f2fd;" +
-  "align-self:flex-end;max-width:85%;word-wrap:break-word;line-height:1.5;";
+  "align-self:flex-end;max-width:85%;word-wrap:break-word;line-height:1.5;" +
+  "user-select:text;-moz-user-select:text;";
 
 const BUBBLE_STYLE_ASSISTANT =
   "padding:8px 12px;border-radius:12px 12px 12px 2px;background:#f5f5f5;" +
-  "align-self:flex-start;max-width:85%;word-wrap:break-word;line-height:1.5;white-space:pre-wrap;";
+  "align-self:flex-start;max-width:85%;word-wrap:break-word;line-height:1.5;white-space:pre-wrap;" +
+  "user-select:text;-moz-user-select:text;position:relative;";
 
 function appendBubble(
   container: HTMLElement,
@@ -769,18 +873,76 @@ function appendBubble(
     role === "user" ? BUBBLE_STYLE_USER : BUBBLE_STYLE_ASSISTANT;
   bubble.textContent = text;
   container.appendChild(bubble);
+  if (role === "assistant") {
+    appendCopyButton(bubble, doc, () => text);
+  }
 }
 
+/**
+ * Appends a copy-to-clipboard button to an assistant bubble.
+ * The button appears on hover and shows a ✓ checkmark for 1.2 s after copying.
+ * Uses ztoolkit.Clipboard (XPCOM nsIClipboard) with navigator.clipboard fallback.
+ */
+function appendCopyButton(
+  bubble: HTMLElement,
+  doc: Document,
+  getText: () => string,
+): void {
+  const btn = h(doc, "button") as HTMLButtonElement;
+  btn.textContent = "\uD83D\uDCCB"; // 📋
+  btn.title = "Copy to clipboard";
+  btn.style.cssText =
+    "position:absolute;top:4px;right:4px;background:rgba(255,255,255,0.8);" +
+    "border:1px solid #ddd;border-radius:3px;cursor:pointer;font-size:12px;" +
+    "padding:2px 4px;opacity:0;transition:opacity 0.15s;" +
+    "line-height:1;user-select:none;-moz-user-select:none;";
+
+  bubble.addEventListener("mouseenter", () => { btn.style.opacity = "1"; });
+  bubble.addEventListener("mouseleave", () => {
+    if (btn.textContent !== "\u2713") btn.style.opacity = "0";
+  });
+
+  btn.addEventListener("click", (e) => {
+    (e as MouseEvent).stopPropagation();
+    try {
+      new (ztoolkit.Clipboard as any)().addText(getText(), "text/unicode").copy();
+    } catch {
+      try { (navigator as any).clipboard?.writeText?.(getText()); } catch { return; }
+    }
+    btn.textContent = "\u2713"; // ✓
+    btn.style.opacity = "1";
+    const win = doc.defaultView ?? (globalThis as any);
+    win.setTimeout(() => {
+      btn.textContent = "\uD83D\uDCCB";
+      if (!bubble.matches(":hover")) btn.style.opacity = "0";
+    }, 1200);
+  });
+  bubble.appendChild(btn);
+}
+
+/**
+ * Appends a system note (e.g. chunk-selection info) to the message area.
+ *
+ * @param shouldStick - When called from the send cycle, pass
+ *   `scrollState.stick` so the note scrolls into view when the user was at
+ *   the bottom. This prevents the note's DOM insertion from pushing the user
+ *   past the `isNearBottom` threshold (which would create a false negative
+ *   on the next `isNearBottom` check). When omitted, does not scroll.
+ */
 function appendSystemNote(
   container: HTMLElement,
   doc: Document,
   text: string,
+  shouldStick?: boolean,
 ): void {
   const note = h(doc,"div");
   note.style.cssText =
     "font-size:11px;color:#999;text-align:center;padding:4px 8px;";
   note.textContent = `\u2139 ${text}`;
   container.appendChild(note);
+  if (shouldStick !== undefined) {
+    scrollToBottom(container, shouldStick);
+  }
 }
 
 /**
@@ -847,18 +1009,23 @@ async function notifyOllamaIfUnavailable(
 /**
  * Appends a mutable status note (e.g. "Extracting paper…") that can be
  * updated in-place or removed once no longer needed.
+ *
+ * @param shouldStick - When called from the send cycle, pass
+ *   `scrollState.stick` so the note respects the user's scroll position.
+ *   When omitted, force-scrolls (e.g. for notes outside the send cycle).
  */
 function appendStatusNote(
   container: HTMLElement,
   doc: Document,
   text: string,
+  shouldStick?: boolean,
 ): HTMLElement {
   const note = h(doc, "div");
   note.style.cssText =
     "font-size:11px;color:#888;text-align:center;padding:4px 8px;font-style:italic;";
   note.textContent = text;
   container.appendChild(note);
-  container.scrollTop = container.scrollHeight;
+  scrollToBottom(container, shouldStick);
   return note;
 }
 
