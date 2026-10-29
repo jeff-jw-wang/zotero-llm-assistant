@@ -42,7 +42,8 @@ import { makeChunkCiteRegex, CHUNK_ID_PATTERN } from "../rag/chunker";
 import {
   createProvider,
   checkPrivacy,
-  getChatOptions,
+  getInputBudget,
+  resolveChatOptions,
 } from "../llm/client";
 import { OllamaProvider } from "../llm/providers/ollama";
 import {
@@ -413,7 +414,29 @@ async function handleQuestion(
 
   // --- Build RAG context via pipeline ---
   const statusNote = appendStatusNote(messages, doc, "Extracting and analysing paper\u2026", scrollState.stick);
-  const options = getChatOptions();
+
+  // Resolve the model and its real input budget. Both come from provider
+  // discovery, so an unpinned model and an unknown context window both work.
+  let options;
+  let inputBudget;
+  try {
+    // Both read the same cached discovery result, so this is one round trip.
+    const [resolvedOptions, resolvedBudget] = await Promise.all([
+      resolveChatOptions(),
+      getInputBudget(),
+    ]);
+    options = resolvedOptions;
+    inputBudget = resolvedBudget.budget;
+  } catch (resolveErr: any) {
+    statusNote.remove();
+    appendBubble(
+      messages,
+      doc,
+      "assistant",
+      `⚠️ ${resolveErr?.message ?? String(resolveErr)}`,
+    );
+    return;
+  }
 
   let fullResponse = "";
   let pipeline;
@@ -445,7 +468,7 @@ async function handleQuestion(
       ztoolkit.log("Failed to load conversation history:", dbErr?.message ?? dbErr);
     }
 
-    pipeline = await buildRAGContext(item, question, history, options.model);
+    pipeline = await buildRAGContext(item, question, history, inputBudget);
 
     // Refresh sticky-scroll after the big async gap (PDF extraction + chunking
     // can take seconds). The user may have scrolled up during the wait.
@@ -741,9 +764,12 @@ function openPDFAtPage(page: number, item: Zotero.Item): void {
       pdfItem = item;
     } else {
       const attachmentIDs: number[] = item.getAttachments();
+      // Zotero.Items.get() returns false for IDs it cannot resolve, so drop
+      // those before matching on attachmentContentType.
       pdfItem = attachmentIDs
         .map((id) => Zotero.Items.get(id))
-        .find((att) => att?.attachmentContentType === "application/pdf");
+        .filter((att): att is Zotero.Item => !!att)
+        .find((att) => att.attachmentContentType === "application/pdf");
     }
 
     if (pdfItem) {
@@ -1083,7 +1109,7 @@ function shouldRetryNonStream(err: any): boolean {
  * Builds the diagnostics footer string appended after each LLM response.
  *
  * Format: `{model} · {host} · {mode} · ~{tokens} tokens`
- * Example: `gpt-4o-mini · api.openai.com · stream · ~4,231 tokens`
+ * Example: `claude-haiku-5-5 · api.anthropic.com · stream · ~4,231 tokens`
  *
  * Redaction rules (ROADMAP §diagnostics):
  *   - Only the hostname is shown — no path, no query parameters, no port.

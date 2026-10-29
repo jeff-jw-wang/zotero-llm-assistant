@@ -14,14 +14,16 @@ pref("privacy.cloudSharingEnabled", false);
 // --- LLM Provider ---
 pref("llm.provider", "ollama");
 pref("llm.ollama.endpoint", "http://localhost:11434");
-pref("llm.ollama.model", "llama3.2");
+pref("llm.ollama.model", "");            // empty = auto-detect installed model
+pref("llm.ollama.numCtx", 16384);       // cap by available RAM, not model claim
 pref("llm.gemini.apiKey", "");
-pref("llm.gemini.model", "gemini-2.0-flash");
+pref("llm.gemini.model", "");           // empty = auto-detect from provider
 pref("llm.openai.apiKey", "");
-pref("llm.openai.model", "gpt-4o-mini");
+pref("llm.openai.model", "");           // empty = auto-detect from provider
 pref("llm.openai.endpoint", "https://api.openai.com");
 pref("llm.anthropic.apiKey", "");
-pref("llm.anthropic.model", "claude-sonnet-4-6");
+pref("llm.anthropic.model", "claude-haiku-5-5");
+pref("llm.anthropic.effort", "");        // empty = model default
 pref("llm.custom.endpoint", "");
 pref("llm.custom.apiKey", "");
 pref("llm.custom.model", "");

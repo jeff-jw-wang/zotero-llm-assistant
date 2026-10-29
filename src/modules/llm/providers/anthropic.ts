@@ -21,11 +21,22 @@ import type {
   ChatOptions,
   StreamChunk,
 } from "../types";
-import { httpPost } from "../../../utils/http";
+import { httpGet, httpPost } from "../../../utils/http";
 
 const ENDPOINT = "https://api.anthropic.com/v1/messages";
+const MODELS_ENDPOINT = "https://api.anthropic.com/v1/models?limit=1";
 const API_VERSION = "2023-06-01";
-const DEFAULT_MAX_TOKENS = 4096;
+/**
+ * Default output cap for non-streaming requests.
+ *
+ * Was 4096, which truncated long answers mid-sentence. Current guidance is
+ * ~16K for non-streaming (keeps the response under HTTP timeouts) and ~64K
+ * for streaming, where timeouts are not a concern.
+ */
+const DEFAULT_MAX_TOKENS = 16_000;
+
+/** Default output cap for streaming requests. */
+const DEFAULT_STREAM_MAX_TOKENS = 64_000;
 
 /** Connection timeout (ms) for the initial fetch. */
 const CONNECTION_TIMEOUT_MS = 30_000;
@@ -47,8 +58,19 @@ export class AnthropicProvider implements ILLMProvider {
    * Converts our LLMMessage[] to Anthropic's request format.
    * System messages are extracted to the top-level `system` field.
    * user/assistant messages go to the `messages` array (roles unchanged).
+   *
+   * `system` is sent as an **array of content blocks**, not a bare string.
+   * Functionally identical today, but only the array form can carry
+   * `cache_control`, which Phase 2 needs to cache the stable prompt prefix.
+   *
+   * @param defaultMaxTokens - Output cap when the caller does not set one;
+   *   differs between streaming and non-streaming requests.
    */
-  private buildRequest(messages: LLMMessage[], options: ChatOptions) {
+  private buildRequest(
+    messages: LLMMessage[],
+    options: ChatOptions,
+    defaultMaxTokens: number = DEFAULT_MAX_TOKENS,
+  ) {
     const systemParts: string[] = [];
     const apiMessages: Array<{ role: string; content: string }> = [];
 
@@ -62,9 +84,13 @@ export class AnthropicProvider implements ILLMProvider {
 
     return {
       model: options.model,
-      max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-      ...(systemParts.length > 0 && { system: systemParts.join("\n\n") }),
+      max_tokens: options.maxTokens ?? defaultMaxTokens,
+      ...(systemParts.length > 0 && {
+        system: [{ type: "text", text: systemParts.join("\n\n") }],
+      }),
       ...(options.temperature != null && { temperature: options.temperature }),
+      // Omitted unless the user opts in, so the model's own default applies.
+      ...(options.effort && { output_config: { effort: options.effort } }),
       messages: apiMessages,
     };
   }
@@ -91,7 +117,7 @@ export class AnthropicProvider implements ILLMProvider {
     options: ChatOptions,
   ): AsyncGenerator<StreamChunk, void, unknown> {
     const body = {
-      ...this.buildRequest(messages, options),
+      ...this.buildRequest(messages, options, DEFAULT_STREAM_MAX_TOKENS),
       stream: true,
     };
 
@@ -201,18 +227,15 @@ export class AnthropicProvider implements ILLMProvider {
   async isAvailable(): Promise<boolean> {
     if (!this.apiKey) return false;
     try {
-      // Send a minimal request to verify the API key is valid.
-      // A 400 (bad request) still means the API is reachable and the key works.
-      const res = await httpPost(ENDPOINT, JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1,
-        messages: [{ role: "user", content: "ping" }],
-      }), {
-        "Content-Type": "application/json",
+      // Probe /v1/models rather than sending a Messages request. A Messages
+      // ping has to name a model, which means hardcoding one that goes stale
+      // and then fails for a reason unrelated to the key. Listing models is
+      // model-agnostic, free, and verifies reachability and the key at once.
+      const res = await httpGet(MODELS_ENDPOINT, {
         "x-api-key": this.apiKey,
         "anthropic-version": API_VERSION,
       }, 5000);
-      return res.ok || res.status === 400;
+      return res.ok;
     } catch {
       return false;
     }

@@ -23,7 +23,7 @@ import { h } from "../../utils/dom";
 import {
   createProvider,
   checkLibraryPrivacy,
-  getChatOptions,
+  resolveChatOptions,
 } from "../llm/client";
 import {
   searchLibrary,
@@ -746,7 +746,7 @@ async function handleLibraryQuestion(
   ];
 
   // --- Stream response (with non-stream fallback if SSE fails) ---
-  const options = getChatOptions();
+  const options = await resolveChatOptions();
   const bubble = h(doc,"div");
   bubble.style.cssText = BUBBLE_STYLE_ASSISTANT;
   messagesArea.appendChild(bubble);

@@ -9,6 +9,7 @@ AI-powered research assistant for Zotero — chat with papers, search your libra
 - **Clickable citations** — The LLM cites chunk IDs that resolve to page links; click to jump directly to the source page in the PDF
 - **Library search** — Search your entire Zotero library by metadata (title, authors, tags, abstract) and ask questions across papers
 - **Multi-provider LLM support** — Ollama (local, default), Google Gemini, OpenAI, Anthropic, or any OpenAI-compatible endpoint
+- **Automatic model discovery** — model names and context windows are read from the provider at runtime, so defaults don't go stale between releases. Leave the model field empty for "use the best available"
 - **Privacy-first** — Cloud sharing is OFF by default; per-item privacy flags let you protect sensitive papers from being sent to cloud APIs
 - **Conversation history** — Stored locally in IndexedDB; conversations are per-paper and persist across sessions
 
@@ -30,14 +31,15 @@ AI-powered research assistant for Zotero — chat with papers, search your libra
 ## Quick Start
 
 1. **Configure a provider** — Go to `Zotero → Settings → LLM Assistant` and select a provider:
-   - **Ollama** (default): Install [Ollama](https://ollama.com/), pull a model (`ollama pull llama3.2`), and the plugin auto-detects it at `localhost:11434`
+   - **Ollama** (default): Install [Ollama](https://ollama.com/), pull a model (`ollama pull qwen3.5:4b` is a good fit for an 8 GB machine), and the plugin auto-detects it at `localhost:11434`
    - **Gemini**: Enter your [Google AI Studio](https://aistudio.google.com/apikey) API key
    - **OpenAI**: Enter your OpenAI API key
    - **Anthropic**: Enter your Anthropic API key
    - **Custom**: Enter any OpenAI-compatible endpoint URL and API key
-2. **Open a paper** — Double-click any PDF in your library to open the reader
-3. **Open the chat panel** — Click the LLM Assistant icon in the reader sidebar
-4. **Ask a question** — Type a question and press Enter
+2. **Pick a model** (optional) — Leave the Model field empty to auto-select the best available one, or press **Detect** to see what the provider offers and pin a specific model
+3. **Open a paper** — Double-click any PDF in your library to open the reader
+4. **Open the chat panel** — Click the LLM Assistant icon in the reader sidebar
+5. **Ask a question** — Type a question and press Enter
 
 ## Building from Source
 
@@ -111,6 +113,7 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model.
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — System design, data flow, module map
+- [Modernization plan](docs/MODERNIZATION_PLAN_2026.md) — October 2026 review and staged update plan
 - [Development](docs/DEVELOPMENT.md) — Dev setup, build system, testing
 - [Security](docs/SECURITY.md) — Threat model, SSRF policy, prompt injection defense
 - [Zotero API](docs/ZOTERO_API.md) — Spike outcomes, undocumented APIs used

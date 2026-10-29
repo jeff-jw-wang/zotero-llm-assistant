@@ -29,6 +29,7 @@ import { AnthropicProvider } from "./providers/anthropic";
 import * as prefs from "../../prefs";
 import { isItemPrivate } from "../storage/db";
 import { validateEndpointURL } from "../../utils/url";
+import { listModels, resolveInputBudget, resolveContextWindow } from "./models";
 
 /** System prompt prefix for all LLM calls. See PLAN.md "Prompt Injection Guardrails". */
 const SYSTEM_PROMPT = `You are a research assistant helping the user understand academic papers.
@@ -134,8 +135,188 @@ export async function autoDetectProvider(): Promise<ILLMProvider> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Model resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Credentials and endpoint for a provider, as model discovery needs them.
+ */
+function providerCredentials(provider: prefs.ProviderName): {
+  endpoint?: string;
+  apiKey?: string;
+} {
+  switch (provider) {
+    case "ollama":
+      return { endpoint: prefs.getOllamaEndpoint() };
+    case "anthropic":
+      return { apiKey: prefs.getAnthropicApiKey() };
+    case "openai":
+      return {
+        endpoint: prefs.getOpenAIEndpoint(),
+        apiKey: prefs.getOpenAIApiKey(),
+      };
+    case "gemini":
+      return { apiKey: prefs.getGeminiApiKey() };
+    case "custom":
+      return {
+        endpoint: prefs.getCustomEndpoint(),
+        apiKey: prefs.getCustomApiKey(),
+      };
+  }
+}
+
+/**
+ * Model-preference patterns per provider, best first.
+ *
+ * Used only when the user has not pinned a model (the pref is empty), to pick
+ * a sensible one from whatever the provider currently offers. This is how the
+ * plugin avoids shipping hardcoded model IDs that go stale between releases.
+ *
+ * Within a pattern, the highest version number wins, so a newer model is
+ * preferred automatically as providers ship them.
+ */
+const MODEL_PREFERENCE: Record<prefs.ProviderName, RegExp[]> = {
+  // Tuned for paper Q&A on modest hardware: long context and good
+  // instruction-following matter more than raw reasoning benchmarks, and a
+  // mixture-of-experts model gives large-model quality at small-model speed.
+  ollama: [/qwen3\.5/, /qwen3/, /gpt-oss/, /phi-4/, /gemma/, /llama/, /mistral/],
+  // Cheapest tier first — grounded Q&A over supplied text does not need Opus.
+  anthropic: [/haiku/, /sonnet/, /opus/],
+  // Flash over Pro for cost; full Flash over Flash-Lite for quality.
+  gemini: [/flash(?!-lite)/, /flash/, /pro/],
+  openai: [/mini/, /^gpt-5/, /^gpt-/],
+  custom: [/./],
+};
+
+/** Extracts a crude numeric version from a model ID, for "newest wins". */
+function versionScore(id: string): number {
+  const nums = id.match(/\d+(?:\.\d+)?/g);
+  if (!nums) return 0;
+  // Weight the first two numbers so 5.5 beats 5, and 5 beats 4.8.
+  const major = parseFloat(nums[0]!) || 0;
+  const minor = nums[1] ? parseFloat(nums[1]!) || 0 : 0;
+  return major * 100 + minor;
+}
+
+/**
+ * Resolves the model ID to use for the active provider.
+ *
+ * If the user pinned one in Settings, that wins. Otherwise the best available
+ * model is picked from provider discovery using {@link MODEL_PREFERENCE}.
+ *
+ * @throws Error with actionable guidance if nothing can be resolved — for
+ *   Ollama this is the common "installed no models yet" case.
+ */
+export async function resolveModelId(
+  provider: prefs.ProviderName = prefs.getActiveProvider(),
+): Promise<string> {
+  const pinned = (() => {
+    switch (provider) {
+      case "ollama":
+        return prefs.getOllamaModel();
+      case "anthropic":
+        return prefs.getAnthropicModel();
+      case "gemini":
+        return prefs.getGeminiModel();
+      case "openai":
+        return prefs.getOpenAIModel();
+      case "custom":
+        return prefs.getCustomModel();
+    }
+  })();
+
+  if (pinned) return pinned;
+
+  const creds = providerCredentials(provider);
+  const available = await listModels(provider, creds);
+
+  for (const pattern of MODEL_PREFERENCE[provider]) {
+    const matches = available.filter((m) => pattern.test(m.id.toLowerCase()));
+    if (matches.length > 0) {
+      matches.sort((a, b) => versionScore(b.id) - versionScore(a.id));
+      return matches[0]!.id;
+    }
+  }
+
+  // Nothing matched a preference pattern — take whatever exists.
+  if (available.length > 0) return available[0]!.id;
+
+  if (provider === "ollama") {
+    throw new Error(
+      "No Ollama models found. Install one first, e.g. `ollama pull qwen3.5:4b` " +
+        "(a good fit for 8GB machines), then reopen this panel.",
+    );
+  }
+  throw new Error(
+    `Could not determine a model for ${provider}. Set one explicitly in ` +
+      "Settings > LLM Assistant.",
+  );
+}
+
+/**
+ * Returns the ChatOptions for the current provider, resolving the model via
+ * discovery when the user has not pinned one.
+ *
+ * Prefer this over the synchronous {@link getChatOptions}, which cannot run
+ * discovery and so returns an empty model when the pref is unset.
+ */
+export async function resolveChatOptions(): Promise<ChatOptions> {
+  const provider = prefs.getActiveProvider();
+  const model = await resolveModelId(provider);
+  const effort =
+    provider === "anthropic" ? prefs.getAnthropicEffort() : "";
+  return { model, stream: true, ...(effort && { effort }) };
+}
+
+/**
+ * Resolves the usable input-token budget for the active provider and model.
+ *
+ * Replaces the old `getTokenCap()` lookup table, whose 8K fallback silently
+ * crippled any model it did not recognise. The chain is: provider-reported
+ * context window → family inference → generous fallback, then the billing-band
+ * cap and the output reserve. For Ollama the configured `num_ctx` also caps it,
+ * since RAM rather than the model's advertised window is the real limit.
+ *
+ * @returns The budget, the window it came from, the resolved model, and the
+ *   reason a billing cap applied (for display in the diagnostics footer).
+ */
+export async function getInputBudget(): Promise<{
+  budget: number;
+  window: number;
+  model: string;
+  cappedBy?: string;
+}> {
+  const provider = prefs.getActiveProvider();
+  const model = await resolveModelId(provider);
+  const creds = providerCredentials(provider);
+
+  let contextWindow: number | undefined;
+  try {
+    contextWindow = await resolveContextWindow(provider, model, creds);
+  } catch {
+    // Discovery unavailable — resolveInputBudget() falls back to inference.
+    contextWindow = undefined;
+  }
+
+  const localNumCtx =
+    provider === "ollama" ? prefs.getOllamaNumCtx() : undefined;
+
+  const resolved = resolveInputBudget(
+    provider,
+    model,
+    contextWindow,
+    localNumCtx,
+  );
+
+  return { ...resolved, model };
+}
+
 /**
  * Returns the ChatOptions for the current provider.
+ *
+ * Synchronous and therefore cannot resolve an unpinned model — `model` may be
+ * empty. Use {@link resolveChatOptions} on request paths.
  */
 export function getChatOptions(): ChatOptions {
   const providerName = prefs.getActiveProvider();
@@ -146,12 +327,18 @@ export function getChatOptions(): ChatOptions {
       return { model: prefs.getGeminiModel(), stream: true };
     case "openai":
       return { model: prefs.getOpenAIModel(), stream: true };
-    case "anthropic":
-      return { model: prefs.getAnthropicModel(), stream: true };
+    case "anthropic": {
+      const effort = prefs.getAnthropicEffort();
+      return {
+        model: prefs.getAnthropicModel(),
+        stream: true,
+        ...(effort && { effort }),
+      };
+    }
     case "custom":
       return { model: prefs.getCustomModel(), stream: true };
     default:
-      return { model: "llama3.2", stream: true };
+      return { model: "", stream: true };
   }
 }
 

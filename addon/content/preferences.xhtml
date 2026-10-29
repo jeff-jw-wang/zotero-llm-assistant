@@ -49,10 +49,34 @@
       <html:input
         type="text"
         id="zotero-prefpane-__addonRef__-ollama-model"
-        placeholder="llama3.2"
+        placeholder="auto-detect installed model"
         style="flex: 1;"
       />
+      <button
+        id="zotero-prefpane-__addonRef__-ollama-detect-btn"
+        data-l10n-id="pref-detect-models"
+        style="font-size: 11px; margin-left: 6px;"
+      />
     </hbox>
+    <html:span
+      id="zotero-prefpane-__addonRef__-ollama-model-status"
+      style="font-size: 11px; color: #666; margin-left: 100px;"
+    ></html:span>
+    <hbox align="center" style="margin-top: 4px;">
+      <html:label
+        for="zotero-prefpane-__addonRef__-ollama-numctx"
+        data-l10n-id="pref-ollama-numctx-label"
+        style="min-width: 100px;"
+      ></html:label>
+      <html:input
+        type="number"
+        min="2048"
+        step="2048"
+        id="zotero-prefpane-__addonRef__-ollama-numctx"
+        style="width: 120px;"
+      />
+    </hbox>
+    <description style="color: #666; font-size: 11px;" data-l10n-id="pref-ollama-numctx-hint" />
     <description style="color: #666; font-size: 11px;" data-l10n-id="pref-ollama-hint" />
     <hbox align="center" style="margin-top: 4px; gap: 8px;">
       <html:span
@@ -95,10 +119,19 @@
       <html:input
         type="text"
         id="zotero-prefpane-__addonRef__-gemini-model"
-        placeholder="gemini-2.0-flash"
+        placeholder="auto-detect"
         style="flex: 1;"
       />
+      <button
+        id="zotero-prefpane-__addonRef__-gemini-detect-btn"
+        data-l10n-id="pref-detect-models"
+        style="font-size: 11px; margin-left: 6px;"
+      />
     </hbox>
+    <html:span
+      id="zotero-prefpane-__addonRef__-gemini-model-status"
+      style="font-size: 11px; color: #666; margin-left: 100px;"
+    ></html:span>
     <description style="color: #666; font-size: 11px;" data-l10n-id="pref-gemini-hint" />
   </vbox>
 
@@ -125,10 +158,19 @@
       <html:input
         type="text"
         id="zotero-prefpane-__addonRef__-openai-model"
-        placeholder="gpt-4o-mini"
+        placeholder="auto-detect"
         style="flex: 1;"
       />
+      <button
+        id="zotero-prefpane-__addonRef__-openai-detect-btn"
+        data-l10n-id="pref-detect-models"
+        style="font-size: 11px; margin-left: 6px;"
+      />
     </hbox>
+    <html:span
+      id="zotero-prefpane-__addonRef__-openai-model-status"
+      style="font-size: 11px; color: #666; margin-left: 100px;"
+    ></html:span>
     <hbox align="center">
       <html:label
         for="zotero-prefpane-__addonRef__-openai-endpoint"
@@ -172,10 +214,35 @@
       <html:input
         type="text"
         id="zotero-prefpane-__addonRef__-anthropic-model"
-        placeholder="claude-sonnet-4-6"
+        placeholder="claude-haiku-5-5"
         style="flex: 1;"
       />
+      <button
+        id="zotero-prefpane-__addonRef__-anthropic-detect-btn"
+        data-l10n-id="pref-detect-models"
+        style="font-size: 11px; margin-left: 6px;"
+      />
     </hbox>
+    <html:span
+      id="zotero-prefpane-__addonRef__-anthropic-model-status"
+      style="font-size: 11px; color: #666; margin-left: 100px;"
+    ></html:span>
+    <hbox align="center" style="margin-top: 4px;">
+      <html:label
+        for="zotero-prefpane-__addonRef__-anthropic-effort"
+        data-l10n-id="pref-effort-label"
+        style="min-width: 100px;"
+      ></html:label>
+      <menulist id="zotero-prefpane-__addonRef__-anthropic-effort" native="true">
+        <menupopup>
+          <menuitem label="Model default" value="" />
+          <menuitem label="Low (cheapest)" value="low" />
+          <menuitem label="Medium" value="medium" />
+          <menuitem label="High" value="high" />
+        </menupopup>
+      </menulist>
+    </hbox>
+    <description style="color: #666; font-size: 11px;" data-l10n-id="pref-effort-hint" />
     <description style="color: #666; font-size: 11px;" data-l10n-id="pref-anthropic-hint" />
   </vbox>
 

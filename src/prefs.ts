@@ -68,11 +68,31 @@ export function setOllamaEndpoint(endpoint: string): void {
 }
 
 export function getOllamaModel(): string {
-  return (getPref("llm.ollama.model") as string) || "llama3.2";
+  // Empty means "auto": resolveModelId() picks from locally installed models.
+  return (getPref("llm.ollama.model") as string) || "";
 }
 
 export function setOllamaModel(model: string): void {
   setPref("llm.ollama.model", model);
+}
+
+/**
+ * Ollama context window (`num_ctx`) in tokens.
+ *
+ * For a local model the binding constraint is the user's RAM, not the model's
+ * advertised context length — a 4B model at 256K claimed context will not fit
+ * 256K of KV cache on an 8GB laptop. This pref is the user's statement of what
+ * their machine can actually hold, and it caps the input budget regardless of
+ * what the model reports. Lower it if Ollama starts swapping.
+ */
+export function getOllamaNumCtx(): number {
+  const raw = getPref("llm.ollama.numCtx");
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : 16_384;
+}
+
+export function setOllamaNumCtx(numCtx: number): void {
+  setPref("llm.ollama.numCtx", numCtx);
 }
 
 // --- Gemini ---
@@ -85,7 +105,8 @@ export function setGeminiApiKey(key: string): void {
 }
 
 export function getGeminiModel(): string {
-  return (getPref("llm.gemini.model") as string) || "gemini-2.0-flash";
+  // Empty means "auto": resolveModelId() picks from the provider's model list.
+  return (getPref("llm.gemini.model") as string) || "";
 }
 
 export function setGeminiModel(model: string): void {
@@ -102,7 +123,8 @@ export function setOpenAIApiKey(key: string): void {
 }
 
 export function getOpenAIModel(): string {
-  return (getPref("llm.openai.model") as string) || "gpt-4o-mini";
+  // Empty means "auto": resolveModelId() picks from the provider's model list.
+  return (getPref("llm.openai.model") as string) || "";
 }
 
 export function setOpenAIModel(model: string): void {
@@ -127,11 +149,32 @@ export function setAnthropicApiKey(key: string): void {
 }
 
 export function getAnthropicModel(): string {
-  return (getPref("llm.anthropic.model") as string) || "claude-sonnet-4-6";
+  return (getPref("llm.anthropic.model") as string) || "claude-haiku-5-5";
 }
 
 export function setAnthropicModel(model: string): void {
   setPref("llm.anthropic.model", model);
+}
+
+/** Valid reasoning-effort levels; empty string means "use the model default". */
+export type EffortLevel = "" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * Reasoning effort for Anthropic requests (`output_config.effort`).
+ *
+ * Empty (the default) omits the field so the model's own default applies —
+ * "medium" on Haiku 5.5 and Opus 5.5, "high" on most others. This is the main
+ * quality/cost dial on current models.
+ */
+export function getAnthropicEffort(): EffortLevel {
+  const raw = (getPref("llm.anthropic.effort") as string) || "";
+  return (["low", "medium", "high", "xhigh", "max"] as string[]).includes(raw)
+    ? (raw as EffortLevel)
+    : "";
+}
+
+export function setAnthropicEffort(effort: string): void {
+  setPref("llm.anthropic.effort", effort);
 }
 
 // --- Custom ---

@@ -2,6 +2,11 @@ pref-title = LLM Assistant Settings
 pref-provider-label = LLM Provider
 pref-api-key-label = API Key
 pref-model-label = Model
+pref-detect-models = Detect
+pref-ollama-numctx-label = Context size
+pref-ollama-numctx-hint = Tokens of context to give the local model (num_ctx). This is limited by your RAM, not by what the model advertises — lower it if Ollama starts swapping. 16384 suits an 8 GB machine; raise it if you have more.
+pref-effort-label = Effort
+pref-effort-hint = Reasoning effort. Lower is cheaper and faster; grounded questions about a paper rarely need more than Low or Medium.
 pref-endpoint-label = Endpoint URL
 
 pref-ollama-hint = Ollama runs locally — no data leaves your machine. Install from ollama.com.

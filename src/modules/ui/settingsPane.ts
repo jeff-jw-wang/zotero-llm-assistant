@@ -23,6 +23,8 @@ import { validateEndpointURL, preflightDNSCheck } from "../../utils/url";
 import { isModelReady, isModelRevisionCurrent, ensureModelReady, disposeEmbedder } from "../rag/embedder";
 import { OllamaProvider } from "../llm/providers/ollama";
 import { httpGet } from "../../utils/http";
+import { listModels, clearModelCache } from "../llm/models";
+import { resolveModelId } from "../llm/client";
 
 const ID = (suffix: string) => `zotero-prefpane-${config.addonRef}-${suffix}`;
 const OLLAMA_DOWNLOAD_URL = "https://ollama.com/download";
@@ -70,6 +72,12 @@ export function registerPrefsScripts(win: Window): void {
   // --- Ollama ---
   bindText(doc, ID("ollama-endpoint"), prefs.getOllamaEndpoint(), prefs.setOllamaEndpoint);
   bindText(doc, ID("ollama-model"), prefs.getOllamaModel(), prefs.setOllamaModel);
+  bindNumber(
+    doc,
+    ID("ollama-numctx"),
+    prefs.getOllamaNumCtx(),
+    prefs.setOllamaNumCtx,
+  );
   bindOllamaEnvironment(doc);
 
   // --- Gemini ---
@@ -90,6 +98,12 @@ export function registerPrefsScripts(win: Window): void {
   // --- Anthropic ---
   bindText(doc, ID("anthropic-apikey"), prefs.getAnthropicApiKey(), prefs.setAnthropicApiKey);
   bindText(doc, ID("anthropic-model"), prefs.getAnthropicModel(), prefs.setAnthropicModel);
+  bindMenulist(
+    doc,
+    ID("anthropic-effort"),
+    prefs.getAnthropicEffort(),
+    prefs.setAnthropicEffort,
+  );
 
   // --- Custom ---
   bindEndpointWithValidation(
@@ -101,6 +115,11 @@ export function registerPrefsScripts(win: Window): void {
   );
   bindText(doc, ID("custom-apikey"), prefs.getCustomApiKey(), prefs.setCustomApiKey);
   bindText(doc, ID("custom-model"), prefs.getCustomModel(), prefs.setCustomModel);
+
+  // --- Model discovery ("Detect") buttons ---
+  for (const provider of ["ollama", "gemini", "openai", "anthropic"] as const) {
+    bindModelDetect(doc, provider);
+  }
 
   // --- Semantic search toggle (Phase D) ---
   bindSemanticSearch(doc);
@@ -156,6 +175,140 @@ function bindText(
   el.addEventListener("change", save);
   // Backup: in some XUL panel contexts "change" may not fire on blur.
   el.addEventListener("blur", save);
+}
+
+/**
+ * Binds a numeric input, ignoring values that are not positive integers so a
+ * half-typed entry cannot persist a nonsense context size.
+ */
+function bindNumber(
+  doc: Document,
+  id: string,
+  initialValue: number,
+  setter: (value: number) => void,
+): void {
+  const el = doc.getElementById(id) as HTMLInputElement | null;
+  if (!el) return;
+  el.value = String(initialValue);
+
+  let lastSaved = initialValue;
+  const save = () => {
+    const parsed = parseInt(el.value, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      el.value = String(lastSaved); // Reject, restore last good value.
+      return;
+    }
+    if (parsed !== lastSaved) {
+      setter(parsed);
+      lastSaved = parsed;
+    }
+  };
+
+  el.addEventListener("change", save);
+  el.addEventListener("blur", save);
+}
+
+/** Binds a XUL menulist, which fires "command" rather than "change". */
+function bindMenulist(
+  doc: Document,
+  id: string,
+  initialValue: string,
+  setter: (value: string) => void,
+): void {
+  const el = doc.getElementById(id) as any;
+  if (!el) return;
+  el.value = initialValue;
+  el.addEventListener("command", () => setter(String(el.value ?? "")));
+}
+
+// ---------------------------------------------------------------------------
+// Model discovery
+// ---------------------------------------------------------------------------
+
+/**
+ * Binds a provider's "Detect" button to model discovery.
+ *
+ * Why this exists: the plugin used to ship hardcoded model IDs, which went
+ * stale between releases and — worse — fed a hardcoded token-cap table that
+ * silently clamped unrecognised models to 8K. Model names and context windows
+ * now come from the provider at runtime. This button makes that visible and
+ * lets the user see what is actually available before pinning one.
+ *
+ * Leaving the model field empty is the supported "auto" mode: the request path
+ * resolves the best available model via `resolveModelId()`.
+ */
+function bindModelDetect(
+  doc: Document,
+  provider: "ollama" | "gemini" | "openai" | "anthropic",
+): void {
+  const btn = doc.getElementById(ID(`${provider}-detect-btn`)) as any;
+  const statusEl = doc.getElementById(ID(`${provider}-model-status`));
+  const modelEl = doc.getElementById(
+    ID(`${provider}-model`),
+  ) as HTMLInputElement | null;
+  if (!btn) return;
+
+  const setStatus = (text: string) => {
+    if (statusEl) statusEl.textContent = text;
+  };
+
+  btn.addEventListener("command", () => {
+    void (async () => {
+      setStatus("Checking\u2026");
+      // The user may have just pasted a key; don't serve a cached miss.
+      clearModelCache();
+
+      const creds =
+        provider === "ollama"
+          ? { endpoint: prefs.getOllamaEndpoint() }
+          : provider === "anthropic"
+            ? { apiKey: prefs.getAnthropicApiKey() }
+            : provider === "gemini"
+              ? { apiKey: prefs.getGeminiApiKey() }
+              : {
+                  endpoint: prefs.getOpenAIEndpoint(),
+                  apiKey: prefs.getOpenAIApiKey(),
+                };
+
+      let models;
+      try {
+        models = await listModels(provider, { ...creds, force: true });
+      } catch (err: any) {
+        setStatus(`Could not reach provider: ${err?.message ?? String(err)}`);
+        return;
+      }
+
+      if (models.length === 0) {
+        setStatus(
+          provider === "ollama"
+            ? "No models found. Is Ollama running? Try: ollama pull qwen3.5:4b"
+            : "No models returned — check the API key and endpoint.",
+        );
+        return;
+      }
+
+      // Show what auto mode would choose, so "empty means auto" is legible.
+      let autoPick = "";
+      try {
+        autoPick = await resolveModelId(provider);
+      } catch {
+        autoPick = "";
+      }
+
+      const names = models.map((m) => m.label).join(", ");
+      const current = modelEl?.value.trim();
+      const usingLine = current
+        ? `Using pinned: ${current}.`
+        : autoPick
+          ? `Auto-selected: ${autoPick}.`
+          : "";
+
+      setStatus(
+        `${models.length} model${models.length === 1 ? "" : "s"} available. ` +
+          `${usingLine} ${names}`.trim(),
+      );
+    })();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +367,9 @@ async function refreshOllamaEnvironmentStatus(doc: Document): Promise<void> {
   }
 
   const endpoint = prefs.getOllamaEndpoint().trim() || "http://localhost:11434";
-  const model = prefs.getOllamaModel().trim() || "llama3.2";
+  // Empty means auto-detect, so there is no specific model to verify.
+  const model = prefs.getOllamaModel().trim();
+  const suggestion = model || "qwen3.5:4b";
   const provider = new OllamaProvider(endpoint);
 
   if (checkBtn) checkBtn.disabled = true;
@@ -226,16 +381,35 @@ async function refreshOllamaEnvironmentStatus(doc: Document): Promise<void> {
     if (!available) {
       statusEl.style.color = "#dc2626";
       statusEl.textContent =
-        `Ollama not detected at ${endpoint}. Install Ollama, run "ollama serve", then pull a model (e.g. "ollama pull ${model}").`;
+        `Ollama not detected at ${endpoint}. Install Ollama, run "ollama serve", then pull a model (e.g. "ollama pull ${suggestion}").`;
       if (installBtn) installBtn.hidden = false;
       return;
     }
 
-    const modelAvailable = await isOllamaModelAvailable(endpoint, model);
-    if (modelAvailable === false) {
-      statusEl.style.color = "#b45309";
+    if (model) {
+      const modelAvailable = await isOllamaModelAvailable(endpoint, model);
+      if (modelAvailable === false) {
+        statusEl.style.color = "#b45309";
+        statusEl.textContent =
+          `Ollama is running, but model "${model}" is missing. Run: ollama pull ${model}`;
+        if (installBtn) installBtn.hidden = true;
+        return;
+      }
+    } else {
+      // Auto mode: no pinned model, so "ready" requires at least one installed.
+      const installed = await listModels("ollama", { endpoint, force: true });
+      if (installed.length === 0) {
+        statusEl.style.color = "#b45309";
+        statusEl.textContent =
+          `Ollama is running at ${endpoint} but has no models installed. ` +
+          `Run: ollama pull ${suggestion}`;
+        if (installBtn) installBtn.hidden = true;
+        return;
+      }
+      statusEl.style.color = "#16a34a";
       statusEl.textContent =
-        `Ollama is running, but model "${model}" is missing. Run: ollama pull ${model}`;
+        `✓ Ollama is ready at ${endpoint} (${installed.length} model` +
+        `${installed.length === 1 ? "" : "s"} installed, auto-selected).`;
       if (installBtn) installBtn.hidden = true;
       return;
     }

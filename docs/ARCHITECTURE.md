@@ -149,11 +149,12 @@ appendMessage(itemId, { role, content, sourceChunks })   IndexedDB
 | `src/addon.ts` | `Addon` class holding runtime data (config, ztoolkit, initialized flag) |
 | `src/hooks.ts` | Zotero lifecycle events (startup, shutdown, window load/unload, prefs) |
 | `src/prefs.ts` | All `Zotero.Prefs` reads/writes; single source of truth for setting keys |
-| `src/utils/tokens.ts` | Token estimation (4 chars ≈ 1 token); model-specific caps |
+| `src/utils/tokens.ts` | Token estimation (4 chars ≈ 1 token); topK derivation |
 | `src/utils/url.ts` | SSRF validator for custom endpoints |
 | `src/utils/locale.ts` | FTL localization helpers |
 | `src/modules/llm/types.ts` | `ILLMProvider`, `LLMMessage`, `StreamChunk`, `ChatOptions` interfaces |
-| `src/modules/llm/client.ts` | Provider factory; privacy enforcement; message builder; system prompt |
+| `src/modules/llm/models.ts` | Model discovery + context-window/input-budget resolution |
+| `src/modules/llm/client.ts` | Provider factory; model resolution; privacy enforcement; message builder; system prompt |
 | `src/modules/llm/providers/ollama.ts` | Ollama (local, ndjson streaming) |
 | `src/modules/llm/providers/gemini.ts` | Google Gemini (SSE streaming) |
 | `src/modules/rag/extractor.ts` | PDF text extraction via Zotero.FullText; page splitting; attachment key |

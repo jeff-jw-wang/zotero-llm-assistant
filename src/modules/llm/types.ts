@@ -24,7 +24,7 @@ export interface StreamChunk {
 
 /** Options passed to a chat completion request. */
 export interface ChatOptions {
-  /** The model identifier (e.g. "gemini-2.0-flash", "llama3.2"). */
+  /** The model identifier, resolved by `resolveModelId()` in client.ts. */
   model: string;
   /** Maximum tokens to generate. Omit for provider default. */
   maxTokens?: number;
@@ -32,6 +32,16 @@ export interface ChatOptions {
   temperature?: number;
   /** If true, stream the response. Default: true. */
   stream?: boolean;
+  /**
+   * Reasoning effort, for providers that expose it (currently Anthropic's
+   * `output_config.effort`). Omit to use the model's own default — Haiku 5.5
+   * and Opus 5.5 default to "medium", most others to "high".
+   *
+   * This is the main quality/cost dial on current models: lower effort means
+   * fewer reasoning tokens and a cheaper, faster answer. Grounded Q&A over a
+   * supplied paper rarely needs more than "low" or "medium".
+   */
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 /**

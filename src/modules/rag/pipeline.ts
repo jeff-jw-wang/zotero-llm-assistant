@@ -30,7 +30,7 @@
 import { extractPDF } from "./extractor";
 import { chunkPages, type Chunk } from "./chunker";
 import { buildMessages } from "../llm/client";
-import { getTokenCap, getTopKCap } from "../../utils/tokens";
+import { getTopKCapForBudget } from "../../utils/tokens";
 import type { LLMMessage } from "../llm/types";
 import {
   isModelReady,
@@ -119,14 +119,17 @@ const MARKER_OVERHEAD = 50;
  * @param item - The Zotero item being discussed (must have a PDF attachment).
  * @param question - The user's current question.
  * @param conversationHistory - Previous messages (excluding system + current question).
- * @param model - The LLM model identifier (for token cap lookup).
+ * @param inputBudget - Usable input tokens for this provider/model, from
+ *   `getInputBudget()` in `modules/llm/client.ts`. Callers must pass the
+ *   resolved value; this used to be looked up from a hardcoded per-model table
+ *   that returned 8K for any unrecognised model.
  * @returns Pipeline result with messages, chunk whitelist, and stats.
  */
 export async function buildRAGContext(
   item: Zotero.Item,
   question: string,
   conversationHistory: LLMMessage[],
-  model: string,
+  inputBudget: number,
 ): Promise<PipelineResult> {
   // --- Step 1-2: Extract + Chunk (with cache) ---
   let cached = itemCache.get(item.id);
@@ -203,9 +206,8 @@ export async function buildRAGContext(
   const scored = scoreChunks(chunks, question, chunkEmbeddings, questionEmbedding);
 
   // --- Step 4: Select within token budget + dynamic topK cap ---
-  const tokenCap = getTokenCap(model);
-  const maxChunks = getTopKCap(model); // Caps chunk COUNT independent of token budget.
-  const selected = selectChunks(scored, tokenCap, maxChunks);
+  const maxChunks = getTopKCapForBudget(inputBudget); // Caps chunk COUNT too.
+  const selected = selectChunks(scored, inputBudget, maxChunks);
 
   // --- Step 5: Build context string + whitelist ---
   // Re-sort selected chunks by page order for coherent reading.
@@ -346,7 +348,8 @@ function scoreChunks(
  *
  * If no chunks fit, truncates the highest-scoring chunk to the budget.
  *
- * @param maxChunks - Optional maximum chunk count (dynamic topK from getTopKCap()).
+ * @param maxChunks - Optional maximum chunk count (dynamic topK from
+ *   getTopKCapForBudget()).
  */
 function selectChunks(
   scored: ScoredChunk[],
