@@ -385,6 +385,57 @@ export async function getChunkEmbeddingsByItemId(
 }
 
 /**
+ * Deletes every cached embedding.
+ *
+ * Used when the embedding *method* changes (see `EMBEDDING_METHOD_VERSION` in
+ * embedder.ts). Vectors produced by different methods are not comparable, so
+ * mixing them in one cosine ranking silently degrades retrieval — discarding
+ * and re-deriving them in the background is the only correct migration.
+ */
+export async function clearAllChunkEmbeddings(): Promise<void> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORES.CHUNK_EMBEDDINGS, "readwrite");
+    const req = tx.objectStore(STORES.CHUNK_EMBEDDINGS).clear();
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Loads every library-metadata embedding in one transaction, keyed by Zotero
+ * item key.
+ *
+ * Metadata embeddings are stored under the chunk ID `meta:<itemKey>`. Library
+ * search needs all of them at once to rank semantically across the **whole**
+ * library: the previous design read them one at a time, which only made sense
+ * when semantics merely re-ranked a keyword-selected shortlist. Reading N
+ * records individually would be N IndexedDB round trips per query.
+ *
+ * Memory: ~10K items x 384 dims x 8 bytes ≈ 30 MB as JS numbers. Acceptable at
+ * Zotero library scale, and cheap to scan — a brute-force cosine pass over
+ * 10K vectors is a few milliseconds, so no ANN index is needed.
+ */
+export async function getAllMetaEmbeddings(): Promise<Map<string, number[]>> {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORES.CHUNK_EMBEDDINGS, "readonly");
+    const store = tx.objectStore(STORES.CHUNK_EMBEDDINGS);
+    const req = store.getAll();
+    req.onsuccess = () => {
+      const out = new Map<string, number[]>();
+      for (const rec of (req.result ?? []) as ChunkEmbeddingRecord[]) {
+        if (typeof rec?.chunkId === "string" && rec.chunkId.startsWith("meta:")) {
+          out.set(rec.chunkId.slice(5), rec.vector);
+        }
+      }
+      resolve(out);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
  * Saves (upserts) chunk embeddings in bulk.
  * Uses a single readwrite transaction for efficiency.
  */

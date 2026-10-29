@@ -303,3 +303,21 @@ export function getEmbeddingRuntimeUnsupportedReason(): string {
 export function setEmbeddingRuntimeUnsupportedReason(reason: string): void {
   setPref("embeddings.runtimeUnsupportedReason", reason);
 }
+
+/**
+ * Embedding *method* version of the vectors currently in the cache.
+ *
+ * Distinct from the model revision: the same model produces incomparable
+ * vectors if the way text is fed to it changes. Bumping
+ * `EMBEDDING_METHOD_VERSION` in embedder.ts invalidates the cache without
+ * forcing a model re-download.
+ */
+export function getEmbeddingMethodVersion(): number {
+  const raw = getPref("embeddings.methodVersion");
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export function setEmbeddingMethodVersion(version: number): void {
+  setPref("embeddings.methodVersion", version);
+}

@@ -7,7 +7,8 @@ AI-powered research assistant for Zotero — chat with papers, search your libra
 - **Chat with papers** — Ask questions about any PDF open in the reader; get streaming answers grounded in the document
 - **Cached whole-paper context** — When a paper fits the model's context budget, the full text is sent once and cached, so follow-up questions cost ~10% of the first one instead of re-sending context every turn. Large documents fall back to chunk-based retrieval automatically
 - **Clickable citations** — Answers cite page numbers (or chunk IDs in retrieval mode); click to jump straight to the source page. Citations are validated against the source, so a page or chunk that was never sent is struck through rather than linked
-- **Library search** — Search your entire Zotero library by metadata (title, authors, tags, abstract) and ask questions across papers
+- **Library search** — Ask questions across your whole library ("which papers address this research question?"). Keyword and semantic retrieval run independently over every item and are combined by rank fusion, so papers that match your *meaning* surface even when they share no literal word with your query. Only metadata is sent, never full papers
+- **Separated recall** — When the model adds detail it remembers about a paper rather than reading it from your metadata, that goes in a visually distinct "not verified against your library" block
 - **Multi-provider LLM support** — Ollama (local, default), Google Gemini, OpenAI, Anthropic, or any OpenAI-compatible endpoint
 - **Automatic model discovery** — model names and context windows are read from the provider at runtime, so defaults don't go stale between releases. Leave the model field empty for "use the best available"
 - **Privacy-first** — Cloud sharing is OFF by default; per-item privacy flags let you protect sensitive papers from being sent to cloud APIs

@@ -3,6 +3,12 @@
 Review of `zotero-llm-assistant` v0.1.1b (last commit 2026-03-06) against the
 October 2026 model landscape, and a staged plan for a major update.
 
+> **Status: Phases 1–3 implemented (v0.4.0).** Decisions taken: local target is
+> an 8 GB laptop (Qwen3.5-4B class); default cloud model is Haiku 5.5; phases
+> run in order. 212 tests pass and the XPI builds, but **nothing here has been
+> runtime-tested inside Zotero and no live API call was made** — see
+> "Verification status" at the end of §8.
+
 ---
 
 ## 1. Verdict
@@ -408,7 +414,7 @@ easiest way to get confident fabrication about papers you own.
 Four phases, ordered so that each ships independently and the highest-value
 work lands first.
 
-### Phase 1 — De-stale (v0.2.0) · small, mechanical, unblocks everything
+### Phase 1 — De-stale (v0.2.0) · **done**
 
 1. Model discovery from provider APIs (`/api/tags` for Ollama, models endpoints
    for cloud) replacing hardcoded defaults; free-text override retained.
@@ -420,7 +426,7 @@ work lands first.
    `output_config.effort` plumbed to a settings control.
 5. Dependency refresh; verify Zotero 8; add a real test runner.
 
-### Phase 2 — Token economics (v0.3.0) · the main event
+### Phase 2 — Token economics (v0.3.0) · **done**
 
 6. Restructure `buildMessages()` for prefix stability (stable system →
    stable document → history → volatile question).
@@ -433,12 +439,39 @@ work lands first.
    `cache_read_input_tokens`.
 10. Port citation anchoring to page markers for whole-paper mode.
 
-### Phase 3 — Library intelligence (v0.4.0)
+### Phase 3 — Library intelligence (v0.4.0) · **partly done**
 
-11. Semantic-first hybrid retrieval with RRF; remove the keyword gate.
-12. Full-library background embedding with progress UI.
-13. Embedding model upgrade (EmbeddingGemma-300m or bge-small-en-v1.5).
-14. Filters, survey mode, grounded-vs-general-knowledge labeling, escalation.
+11. **Done** — semantic-first hybrid retrieval with RRF; keyword gate removed.
+12. **Partly** — full-library bulk embedding load and background indexing are
+    in; the progress UI is not.
+13. **Changed approach** — the model was *not* swapped. The actual bug was that
+    512-token chunks were silently truncated at MiniLM's 256-token limit, and
+    that is now fixed by windowing and mean-pooling with the existing,
+    revision-pinned model. A model swap would have meant shipping an
+    unverifiable Hugging Face repo and revision (that host was unreachable, see
+    §10) and losing the pinned-revision supply-chain property for no benefit
+    the windowing fix does not already deliver. `EMBEDDING_METHOD_VERSION`
+    handles cache invalidation, so an actual model upgrade later is now cheap.
+14. **Partly** — grounded-vs-general-knowledge labeling and full abstracts are
+    in; filters, survey mode and escalation are not.
+
+### Remaining from Phase 3
+
+- Background-indexing progress UI (`SearchDiagnostics.semanticCovered` already
+  carries the data).
+- Collection / tag / year / item-type filters.
+- Survey mode — grouped thematic synthesis rather than a ranked list.
+- Escalation — pull full abstracts plus first-page chunks for the top 3–5 items
+  when a question needs substance rather than identification.
+- Embedding model upgrade to EmbeddingGemma-300m, once an ONNX build and its
+  revision hash can be verified.
+- Stable-core / volatile-supplement context split, so oversized cloud documents
+  (theses, books) get cache hits too. Chunk-RAG currently forgoes caching,
+  which is the right trade only because it runs on documents that cannot fit
+  and on local models where tokens are free.
+- Deferred dependency majors: `zotero-plugin-toolkit` 6 (5.2 already dropped
+  the `ZoteroToolkit` export the plugin uses), TypeScript 7, and
+  `@huggingface/transformers` 4.
 
 ### Phase 4 — Optional / later
 
@@ -453,16 +486,32 @@ work lands first.
 
 ---
 
-## 9. Decisions needed before Phase 1
+## 9. Decisions taken
 
-1. **Target hardware for the local model** — materially changes the §6.3 pick.
-2. **Whole-paper threshold** — suggest 100K tokens; above that, stay on RAG.
-3. **Default cloud model** — Sonnet 5.5 (balanced) or Haiku 5.5 (1/20th the
-   input price, likely sufficient here)?
-4. **Embedding model** — EmbeddingGemma-300m (better) vs bge-small-en-v1.5
-   (~6× smaller download)?
-5. **Phase order** — Phase 2 is the highest value; Phase 1 is a prerequisite
-   for little effort. Phase 3 is the biggest functional change.
+1. **Local target: 8 GB laptop.** Qwen3.5-4B class; Phi-4-mini as the lighter
+   fallback. Consequence: whole-paper mode is a *cloud* path. A 4B model plus
+   KV cache plus Zotero does not leave room to hold a whole paper in context on
+   8 GB, so the local provider stays on chunk-RAG — which the budget logic now
+   does automatically, since `num_ctx` caps the budget below the paper size.
+2. **Whole-paper threshold: none needed.** "Fits the resolved input budget" is
+   the whole condition, and that budget already encodes the context window,
+   Haiku 5.5's 100K price band and the user's `num_ctx`.
+3. **Default cloud model: Haiku 5.5.** $0.10/$0.50 per MTok up to 100K input.
+   Combined with prefix caching this makes per-paper cost close to irrelevant.
+4. **Embedding model: unchanged**, truncation fixed instead — see Phase 3 item
+   13 for why.
+5. **Phase order: 1 → 2 → 3**, as implemented.
+
+### Verification status
+
+What was verified here: `tsc --noEmit` clean, 212 tests pass, the XPI builds.
+
+What was **not**: no runtime test inside Zotero, and no live API call to any
+provider. So the `cache_control` request shape, the `output_config.effort`
+field, and every discovery endpoint's response shape are written against
+documented schemas, not observed responses. The first real session should check
+the diagnostics footer: if `cache read` stays at 0 across turns of one
+conversation, caching is not working.
 
 ---
 

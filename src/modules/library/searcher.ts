@@ -16,6 +16,7 @@ import type { ItemMetadata } from "./indexer";
 import { ensureIndex, getIndex } from "./indexer";
 import {
   getAllPrivateItemIds,
+  getAllMetaEmbeddings,
   getChunkEmbedding,
   saveChunkEmbeddings,
   type ChunkEmbeddingRecord,
@@ -136,27 +137,92 @@ export function scoreItem(
   return keywordScore;
 }
 
+/** Reciprocal Rank Fusion constant, from the original RRF paper. */
+export const RRF_K = 60;
+
 /**
- * Searches the library index for items matching the query.
+ * Combines several ranked lists into one with Reciprocal Rank Fusion.
  *
- * Uses two-stage retrieval (D9):
- * 1. Stage 1 — Keyword shortlist: fast keyword scoring on all items, take top-K.
- * 2. Stage 2 — Semantic re-rank (only if model ready): embed query + shortlisted
- *    items' title+abstract, re-rank by D4 blended score.
+ *     score(key) = Σ over lists  1 / (k + rank_in_that_list)
  *
- * Calls `ensureIndex()` to lazily build the index on first use (D3).
+ * RRF is used rather than a weighted sum of the underlying scores because
+ * keyword scores (unbounded integers) and cosine similarities (-1..1) are on
+ * incomparable scales, whereas ranks are comparable by construction. An item
+ * appearing in both lists outranks one that appears in only a single list at a
+ * similar position, which is the behaviour hybrid retrieval wants.
  *
- * When `excludePrivate` is true, private items are fully removed from results
- * — no placeholder emitted, no count revealed (D5).
+ * Pure function — no Zotero or storage dependency.
+ *
+ * @param lists - Ranked lists, each already sorted best-first.
+ * @param k - Rank-smoothing constant; higher flattens the curve.
+ * @returns Keys with fused scores, sorted best-first.
+ */
+export function fuseRankings(
+  lists: string[][],
+  k: number = RRF_K,
+): Array<{ key: string; score: number }> {
+  const fused = new Map<string, number>();
+
+  for (const list of lists) {
+    list.forEach((key, index) => {
+      // Ranks are 1-based.
+      fused.set(key, (fused.get(key) ?? 0) + 1 / (k + index + 1));
+    });
+  }
+
+  return [...fused.entries()]
+    .map(([key, score]) => ({ key, score }))
+    .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
+}
+
+/** Diagnostics about how a search was resolved, for display in the UI. */
+export interface SearchDiagnostics {
+  /** Items in the library index that were eligible (after privacy filtering). */
+  candidates: number;
+  /** Items that matched at least one keyword. */
+  keywordMatches: number;
+  /** Items that had a usable metadata embedding, i.e. semantic coverage. */
+  semanticCovered: number;
+  /** Whether the semantic pass ran at all. */
+  semanticActive: boolean;
+}
+
+/**
+ * Searches the library with semantic-first hybrid retrieval.
+ *
+ * **What changed and why.** The previous implementation used keyword score as
+ * a *gate*: it kept only items with `score > 0`, took the top `maxResults * 3`
+ * of those, and let semantic similarity merely re-rank that shortlist. An item
+ * whose title, authors, tags and abstract shared no literal word with the
+ * query was eliminated before embeddings were ever consulted — so the exact
+ * question this feature exists for ("which papers in my library address this
+ * research question?", phrased in the user's own words) returned little or
+ * nothing, while a title-keyword query worked fine. Semantic search was
+ * present but structurally unable to reach the items it existed to find.
+ *
+ * Now the two retrievers run **independently over the whole library** and are
+ * combined with Reciprocal Rank Fusion:
+ *
+ *     score(item) = Σ over lists  1 / (RRF_K + rank_in_that_list)
+ *
+ * RRF is used rather than a weighted sum of raw scores because keyword scores
+ * and cosine similarities are on incomparable scales; ranks are comparable by
+ * construction. Keyword matching becomes a *contributor*, so an exact title or
+ * author match still wins, while a purely conceptual match can now surface.
+ *
+ * Semantic coverage grows in the background (see `startBackgroundEmbedding`),
+ * so a freshly-installed library starts keyword-only and improves as indexing
+ * proceeds. `SearchDiagnostics.semanticCovered` reports how far along that is.
  *
  * @param query - User search query.
  * @param opts.maxResults - Maximum results to return (default 10).
- * @param opts.excludePrivate - If true, omit items flagged as private.
+ * @param opts.excludePrivate - If true, omit items flagged as private (D5):
+ *   fully removed, with no placeholder and no count revealed.
  */
-export async function searchLibrary(
+export async function searchLibraryDetailed(
   query: string,
   opts?: { maxResults?: number; excludePrivate?: boolean },
-): Promise<SearchResult[]> {
+): Promise<{ results: SearchResult[]; diagnostics: SearchDiagnostics }> {
   await ensureIndex();
 
   const maxResults = opts?.maxResults ?? 10;
@@ -165,120 +231,125 @@ export async function searchLibrary(
     .split(/\s+/)
     .filter((w) => w.length > 1);
 
-  if (keywords.length === 0) return [];
+  const empty: SearchDiagnostics = {
+    candidates: 0,
+    keywordMatches: 0,
+    semanticCovered: 0,
+    semanticActive: false,
+  };
 
-  // Optionally load private item IDs for filtering.
+  if (query.trim().length === 0) {
+    return { results: [], diagnostics: empty };
+  }
+
+  // D5: private items are excluded from the candidate set entirely, before any
+  // ranking, so neither retriever can leak their existence.
   let privateIds: Set<number> | null = null;
   if (opts?.excludePrivate) {
     privateIds = await getAllPrivateItemIds();
   }
 
-  // --- Stage 1: Keyword shortlist ---
-  const keywordResults: SearchResult[] = [];
-
+  const candidates: SearchResult[] = [];
   for (const [_id, meta] of getIndex()) {
-    // D5: fully exclude private items for cloud providers.
     if (privateIds && privateIds.has(meta.itemId)) continue;
-
-    const score = scoreItem(meta, keywords);
-    if (score > 0) {
-      keywordResults.push({
-        itemId: meta.itemId,
-        key: meta.key,
-        title: meta.title,
-        authors: meta.authors,
-        year: meta.year,
-        abstract: meta.abstract,
-        score,
-      });
-    }
+    candidates.push({
+      itemId: meta.itemId,
+      key: meta.key,
+      title: meta.title,
+      authors: meta.authors,
+      year: meta.year,
+      abstract: meta.abstract,
+      score: 0,
+    });
   }
 
-  keywordResults.sort((a, b) => b.score - a.score);
+  if (candidates.length === 0) {
+    return { results: [], diagnostics: empty };
+  }
 
-  // --- Stage 2: Semantic re-rank (if model ready) ---
-  const shortlistSize = maxResults * 3;
-  const shortlist = keywordResults.slice(0, shortlistSize);
+  const byKey = new Map(candidates.map((c) => [c.key, c]));
 
-  if (isModelReady() && shortlist.length > 0) {
+  // --- Retriever 1: keyword ---
+  // Needs the full ItemMetadata (tags are only on the index entry), so score
+  // from the index rather than from the trimmed SearchResult.
+  const keywordScored: Array<{ key: string; score: number }> = [];
+  if (keywords.length > 0) {
+    for (const [_id, meta] of getIndex()) {
+      if (!byKey.has(meta.key)) continue; // filtered out above
+      const score = scoreItem(meta, keywords);
+      if (score > 0) keywordScored.push({ key: meta.key, score });
+    }
+    keywordScored.sort((a, b) => b.score - a.score);
+  }
+
+  // --- Retriever 2: semantic, over every item that has a vector ---
+  const semanticScored: Array<{ key: string; score: number }> = [];
+  let semanticActive = false;
+
+  if (isModelReady()) {
     try {
-      // Embed the query.
-      const queryVec = await embedText(query);
+      const [queryVec, metaVectors] = await Promise.all([
+        embedText(query),
+        getAllMetaEmbeddings(),
+      ]);
 
-      // For each shortlisted item, get or compute the metadata embedding.
-      for (const result of shortlist) {
-        const metaChunkId = "meta:" + result.key;
-        let cached = await getChunkEmbedding(metaChunkId);
-
-        if (!cached) {
-          // Compute and cache the metadata embedding (title + abstract).
-          const text = `${result.title} ${result.abstract}`;
-          const [vector] = await embedTexts([text]);
-          if (vector) {
-            const record: ChunkEmbeddingRecord = {
-              chunkId: metaChunkId,
-              itemId: result.itemId,
-              vector,
-              updatedAt: new Date().toISOString(),
-            };
-            await saveChunkEmbeddings([record]);
-            cached = record;
-          }
-        }
-
-        if (cached) {
-          const rawSimilarity = cosineSimilarity(queryVec, cached.vector);
-          const normSemantic = Math.max(0, rawSimilarity);
-          // Re-score with blended formula.
-          result.score = scoreItem(
-            {
-              itemId: result.itemId,
-              key: result.key,
-              title: result.title,
-              authors: result.authors,
-              year: result.year,
-              abstract: result.abstract,
-              tags: [], // Tags already scored in keyword pass.
-              doi: "",
-              itemType: "",
-            },
-            keywords,
-            normSemantic,
-          );
-        } else {
-          // Embedding failed — use normSemantic=0 on blended scale.
-          result.score = scoreItem(
-            {
-              itemId: result.itemId,
-              key: result.key,
-              title: result.title,
-              authors: result.authors,
-              year: result.year,
-              abstract: result.abstract,
-              tags: [],
-              doi: "",
-              itemType: "",
-            },
-            keywords,
-            0,
-          );
-        }
+      for (const candidate of candidates) {
+        const vec = metaVectors.get(candidate.key);
+        if (!vec) continue; // Not embedded yet — background job will catch up.
+        semanticScored.push({
+          key: candidate.key,
+          score: cosineSimilarity(queryVec, vec),
+        });
       }
 
-      // Re-sort by blended score.
-      shortlist.sort((a, b) => b.score - a.score);
+      semanticScored.sort((a, b) => b.score - a.score);
+      semanticActive = true;
 
-      // Fire-and-forget background indexing (D9).
+      // Keep extending coverage for next time.
       void startBackgroundEmbedding().catch((e: any) =>
         ztoolkit.log("Background embedding error: " + e?.message),
       );
     } catch (err: any) {
-      // Semantic re-rank failed — fall through with keyword-only results.
-      ztoolkit.log("Semantic re-rank failed: " + err?.message);
+      // Semantic retrieval failed — degrade to keyword-only rather than error.
+      ztoolkit.log("Semantic retrieval failed: " + err?.message);
     }
   }
 
-  return shortlist.slice(0, maxResults);
+  // --- Fuse with Reciprocal Rank Fusion ---
+  const results = fuseRankings([
+    keywordScored.map((e) => e.key),
+    semanticScored.map((e) => e.key),
+  ])
+    .slice(0, maxResults)
+    .map(({ key, score }) => {
+      const item = byKey.get(key)!;
+      // Scale to a readable integer; RRF scores are small fractions.
+      return { ...item, score: Math.round(score * 10_000) };
+    });
+
+  return {
+    results,
+    diagnostics: {
+      candidates: candidates.length,
+      keywordMatches: keywordScored.length,
+      semanticCovered: semanticScored.length,
+      semanticActive,
+    },
+  };
+}
+
+/**
+ * Searches the library, returning results only.
+ *
+ * Thin wrapper over {@link searchLibraryDetailed} for callers that do not need
+ * retrieval diagnostics.
+ */
+export async function searchLibrary(
+  query: string,
+  opts?: { maxResults?: number; excludePrivate?: boolean },
+): Promise<SearchResult[]> {
+  const { results } = await searchLibraryDetailed(query, opts);
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +422,17 @@ async function processBatch(
 }
 
 /**
+ * Maximum abstract length included per item, in characters.
+ *
+ * Was 300, which cut most abstracts off mid-sentence and gave the model an
+ * unreliable basis for judging relevance. 1500 covers essentially every real
+ * abstract; at ten results that is roughly 4K tokens of context, which is
+ * negligible against the budgets resolved in `modules/llm/models.ts` and is
+ * the cheapest quality win available on the library path.
+ */
+export const MAX_ABSTRACT_CHARS = 1500;
+
+/**
  * Builds a context string for the LLM from search results.
  *
  * Receives only the already-filtered result list (privacy handled upstream by
@@ -362,8 +444,8 @@ export function buildLLMContext(results: SearchResult[]): string {
   return results
     .map((r) => {
       const abstractSnippet =
-        r.abstract.length > 300
-          ? r.abstract.slice(0, 300) + "..."
+        r.abstract.length > MAX_ABSTRACT_CHARS
+          ? r.abstract.slice(0, MAX_ABSTRACT_CHARS) + "..."
           : r.abstract;
       return [
         `Title: ${r.title}`,

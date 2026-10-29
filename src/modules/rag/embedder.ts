@@ -14,6 +14,7 @@
  * @module modules/rag/embedder
  */
 import * as prefs from "../../prefs";
+import { clearAllChunkEmbeddings } from "../storage/db";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -36,8 +37,45 @@ const MODEL_ID = "Xenova/all-MiniLM-L6-v2";
 const PINNED_REVISION = "751bff37182d3f1213fa05d7196b954e230abad9";
 const HASH_BACKEND_REVISION = "local-hash-v1";
 
+/**
+ * Version of the *method* by which text becomes a vector.
+ *
+ * Bump this whenever the transformation changes in a way that makes new
+ * vectors incomparable with cached ones — even if the model is unchanged. The
+ * cache is cleared and rebuilt in the background on upgrade.
+ *
+ * History:
+ *   1 — single forward pass per text; inputs over the model's 256-token limit
+ *       were silently truncated by the tokenizer.
+ *   2 — long inputs are split into overlapping windows and mean-pooled, so the
+ *       whole text contributes. Pooled vectors differ from truncated ones, so
+ *       v1 vectors must not be ranked alongside v2 vectors.
+ */
+export const EMBEDDING_METHOD_VERSION = 2;
+
 /** Embedding vector dimensions (all-MiniLM-L6-v2). */
 export const EMBEDDING_DIMS = 384;
+
+/**
+ * Maximum input the model actually accepts, in characters.
+ *
+ * all-MiniLM-L6-v2 has a 256-token maximum sequence length — about 1024
+ * characters of English prose. Anything longer is silently truncated by the
+ * tokenizer. That was a real quality bug: chunker.ts targets 2048-character
+ * chunks (~512 tokens), so roughly the **second half of every chunk never
+ * contributed to its embedding**, and long abstracts were cut mid-text.
+ *
+ * 900 is deliberately below the ~1024 ceiling: the chars-per-token ratio is
+ * worse than 4:1 for dense academic prose, citations and numbers, so the
+ * margin keeps real text inside the window.
+ */
+const MAX_INPUT_CHARS = 900;
+
+/**
+ * Overlap between windows, in characters, so a sentence split across a
+ * boundary still contributes coherently to both windows.
+ */
+const WINDOW_OVERLAP_CHARS = 100;
 
 type EmbeddingBackend = "transformers" | "hashing";
 
@@ -438,6 +476,88 @@ export async function ensureModelReady(
   );
   prefs.setEmbeddingRuntimeUnsupported(false);
   prefs.setEmbeddingRuntimeUnsupportedReason("");
+
+  await migrateEmbeddingMethod();
+}
+
+/**
+ * Discards cached vectors produced by an older embedding method.
+ *
+ * Runs once per method bump, right after the model is ready and before any
+ * embedding can be requested. Best-effort: if the cache cannot be cleared the
+ * pref is left alone so the migration retries next time, rather than leaving
+ * mixed-method vectors behind a version that claims to be current.
+ */
+async function migrateEmbeddingMethod(): Promise<void> {
+  if (prefs.getEmbeddingMethodVersion() === EMBEDDING_METHOD_VERSION) return;
+
+  try {
+    await clearAllChunkEmbeddings();
+    prefs.setEmbeddingMethodVersion(EMBEDDING_METHOD_VERSION);
+    ztoolkit.log(
+      `Embeddings: cleared cache for method v${EMBEDDING_METHOD_VERSION}; ` +
+        "vectors will be rebuilt in the background.",
+    );
+  } catch (err: any) {
+    ztoolkit.log(
+      "Embeddings: method migration failed, will retry: " + err?.message,
+    );
+  }
+}
+
+/**
+ * Splits text into overlapping windows that fit the model's input limit.
+ *
+ * Returns a single-element array for text already short enough, which is the
+ * common case for queries and short abstracts.
+ */
+export function windowText(text: string): string[] {
+  if (text.length <= MAX_INPUT_CHARS) return [text];
+
+  const windows: string[] = [];
+  const stride = MAX_INPUT_CHARS - WINDOW_OVERLAP_CHARS;
+
+  for (let start = 0; start < text.length; start += stride) {
+    const slice = text.slice(start, start + MAX_INPUT_CHARS);
+    if (slice.trim().length > 0) windows.push(slice);
+    if (start + MAX_INPUT_CHARS >= text.length) break;
+  }
+
+  return windows.length > 0 ? windows : [text.slice(0, MAX_INPUT_CHARS)];
+}
+
+/**
+ * Mean-pools several window vectors into one, then L2-normalises.
+ *
+ * Mean pooling over windows is the standard way to represent a passage longer
+ * than the encoder's window. Re-normalising afterwards matters because
+ * `cosineSimilarity` and the callers' score blending assume unit vectors —
+ * the component vectors are normalised individually, but their mean is not.
+ */
+export function meanPool(vectors: number[][]): number[] {
+  if (vectors.length === 0) return [];
+  if (vectors.length === 1) return vectors[0]!;
+
+  const dims = vectors[0]!.length;
+  const sum = new Array<number>(dims).fill(0);
+
+  for (const vec of vectors) {
+    for (let i = 0; i < dims && i < vec.length; i++) {
+      sum[i] += vec[i]!;
+    }
+  }
+
+  let norm = 0;
+  for (let i = 0; i < dims; i++) {
+    sum[i] /= vectors.length;
+    norm += sum[i]! * sum[i]!;
+  }
+
+  norm = Math.sqrt(norm);
+  if (norm === 0) return sum;
+
+  for (let i = 0; i < dims; i++) sum[i] /= norm;
+  return sum;
 }
 
 /**
@@ -445,6 +565,10 @@ export async function ensureModelReady(
  *
  * Requires both consent AND a prior call to `ensureModelReady()`. This
  * prevents accidental model downloads from embed calls deep in the pipeline.
+ *
+ * Text longer than the model's input window is split into overlapping windows
+ * and mean-pooled, so the whole string contributes rather than being silently
+ * truncated at 256 tokens.
  *
  * @param text - The text to embed.
  * @param onProgress - Optional callback: (progress: number) => void, 0–1.
@@ -457,14 +581,19 @@ export async function embedText(
 ): Promise<number[]> {
   assertConsentAndReady();
   const currentRunner = await getRunner();
-  const [vector] = await currentRunner.embed([text], onProgress);
-  return vector!;
+  const windows = windowText(text);
+  const vectors = await currentRunner.embed(windows, onProgress);
+  return meanPool(vectors);
 }
 
 /**
  * Embeds an array of texts in batch (for chunked documents).
  *
  * Requires both consent AND a prior call to `ensureModelReady()`.
+ *
+ * Each text is windowed to the model's input limit and mean-pooled, so a
+ * 2048-character chunk is fully represented instead of truncated at 256
+ * tokens. Windows across all texts are embedded in one batch, then regrouped.
  *
  * @param texts - Array of chunk texts.
  * @param onProgress - Optional callback.
@@ -478,8 +607,23 @@ export async function embedTexts(
   if (texts.length === 0) return [];
   assertConsentAndReady();
   const currentRunner = await getRunner();
-  const result = await currentRunner.embed(texts, onProgress);
-  return result;
+
+  // Flatten every text's windows into one batch, remembering the spans so the
+  // per-text vectors can be pooled back in order.
+  const flat: string[] = [];
+  const spans: Array<[number, number]> = [];
+
+  for (const text of texts) {
+    const windows = windowText(text);
+    spans.push([flat.length, windows.length]);
+    flat.push(...windows);
+  }
+
+  const vectors = await currentRunner.embed(flat, onProgress);
+
+  return spans.map(([start, count]) =>
+    meanPool(vectors.slice(start, start + count)),
+  );
 }
 
 /**

@@ -28,5 +28,7 @@ pref("llm.custom.endpoint", "");
 pref("llm.custom.apiKey", "");
 pref("llm.custom.model", "");
 
+pref("embeddings.methodVersion", 0);  // bumped by embedder to invalidate stale vectors
+
 // --- UI ---
 pref("onboarding.completed", false);

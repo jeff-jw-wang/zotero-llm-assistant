@@ -23,6 +23,7 @@ declare namespace _ZoteroTypes {
       "llm.custom.endpoint": string;
       "llm.custom.apiKey": string;
       "llm.custom.model": string;
+      "embeddings.methodVersion": number;
       "onboarding.completed": boolean;
     };
   }

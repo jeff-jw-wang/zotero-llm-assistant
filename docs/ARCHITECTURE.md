@@ -211,6 +211,51 @@ legacy `[p.N]` regex for styled (non-clickable) display.
 
 ---
 
+## Library Retrieval
+
+Library questions send **metadata only** — title, authors, year, abstract and a
+`zotero://` link per match. Full texts are never sent on this path.
+
+Retrieval is hybrid. Keyword and semantic ranking run **independently over the
+whole library**, then fuse by Reciprocal Rank Fusion:
+
+```
+score(item) = Σ over lists  1 / (60 + rank_in_that_list)
+```
+
+This replaced a design where keyword score was a *gate*: only items with
+`score > 0` entered a shortlist, and semantic similarity merely re-ranked those
+survivors. An item sharing no literal word with the query was therefore
+eliminated before embeddings were consulted — so conceptual questions, the
+whole reason the feature exists, returned little. Keyword matching is now a
+contributor, not a filter.
+
+RRF is used rather than a weighted sum because keyword scores (unbounded
+integers) and cosine similarities (−1..1) are on incomparable scales, while
+ranks are comparable by construction.
+
+Semantic coverage grows in the background (`startBackgroundEmbedding`), so a
+fresh library starts keyword-only and improves as indexing proceeds;
+`SearchDiagnostics.semanticCovered` reports progress.
+
+### Embedding method versioning
+
+Vectors are comparable only within one embedding *method*. `EMBEDDING_METHOD_VERSION`
+in `embedder.ts` is bumped whenever the text→vector transformation changes, and
+the cache is cleared and rebuilt — mixing methods in one cosine ranking
+degrades retrieval silently. Method v2 windows long inputs and mean-pools them,
+fixing a bug where chunks (~512 tokens) were silently truncated to the model's
+256-token limit, so roughly half of every chunk never reached the encoder.
+
+### Answer grounding
+
+The model is instructed to keep metadata-grounded claims separate from claims
+it recalls about papers it recognises, using a fixed section heading. The UI
+renders the recalled section in a distinct block labelled "not verified against
+your library". A missing heading degrades safely — the text renders as grounded,
+as it did before the contract existed. `zotero://` links stay whitelisted to
+keys actually sent, in both sections.
+
 ## Privacy Model
 
 Default state: **paper content is never sent to cloud APIs**.
