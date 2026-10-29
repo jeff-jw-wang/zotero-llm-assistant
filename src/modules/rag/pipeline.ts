@@ -7,11 +7,27 @@
  * the Phase A pattern of calling extractor + buildContext + buildMessages
  * inline.
  *
+ * Two context modes:
+ *
+ *   **whole-paper** — chosen whenever the full text fits the input budget.
+ *   The document is sent once, page-marked and unchanged, behind a prompt-cache
+ *   breakpoint. Cheaper (cache reads are ~10% of input price, versus re-sending
+ *   a freshly-selected chunk set at full price every turn) and better (the
+ *   model sees the whole paper, not a keyword-selected subset). Citations are
+ *   page numbers, validated against the page count.
+ *
+ *   **chunk-rag** — the fallback for documents too large for the budget, and
+ *   for local models whose num_ctx is small. Selection still depends on the
+ *   question, so this mode does not benefit from prefix caching; that is an
+ *   accepted trade, since relevance matters more than cache hits when the
+ *   document cannot fit and local inference costs nothing per token.
+ *
  * Flow:
  *   1. Extract PDF text (cached per item to avoid re-extraction)
  *   2. Chunk pages into ~512-token segments with content-hashed IDs
+ *   2b. If the whole paper fits the budget, return whole-paper mode here
  *   3. Score chunks by keyword overlap + structural priority
- *   4. Greedily select top chunks within the model's token budget
+ *   4. Greedily select top chunks within the resolved input budget
  *   5. Build context string with chunk markers [c.ID pp.X-Y]
  *   6. Assemble full LLM message array via client.buildMessages()
  *
@@ -29,8 +45,8 @@
 
 import { extractPDF } from "./extractor";
 import { chunkPages, type Chunk } from "./chunker";
-import { buildMessages } from "../llm/client";
-import { getTopKCapForBudget } from "../../utils/tokens";
+import { buildMessages, type ContextMode } from "../llm/client";
+import { getTopKCapForBudget, estimateTokens } from "../../utils/tokens";
 import type { LLMMessage } from "../llm/types";
 import {
   isModelReady,
@@ -67,11 +83,24 @@ export interface PipelineResult {
    * are valid citations. Used for citation whitelist enforcement in the UI.
    */
   chunkWhitelist: Map<string, ChunkMeta>;
+  /**
+   * How the paper was supplied. Decides the citation scheme the model was told
+   * to use, and therefore how the UI must render citations.
+   */
+  mode: ContextMode;
+  /**
+   * Total pages in the document, in whole-paper mode. Acts as the page
+   * citation whitelist: `[p.N]` is valid only for 1 <= N <= pageCount, so a
+   * hallucinated page is still caught, exactly as an unknown chunk ID is.
+   */
+  pageCount?: number;
   /** Stats for the UI system note. */
   stats: {
     totalPages: number;
     totalChunks: number;
     selectedChunks: number;
+    /** Estimated input tokens of the document block actually sent. */
+    contextTokens: number;
   };
 }
 
@@ -83,6 +112,8 @@ interface CacheEntry {
   chunks: Chunk[];
   attachmentKey: string;
   totalPages: number;
+  /** Extracted pages, retained so whole-paper mode need not re-extract. */
+  pages: Array<{ page: number; text: string }>;
 }
 
 const itemCache = new Map<number, CacheEntry>();
@@ -105,6 +136,30 @@ export function clearItemCache(itemId?: number): void {
 // ---------------------------------------------------------------------------
 
 const CHARS_PER_TOKEN = 4;
+
+/**
+ * Headroom reserved, inside the input budget, for the system prompt,
+ * conversation history and the question itself. Whole-paper mode is chosen
+ * only if the full text fits with this much room to spare.
+ */
+const PROMPT_OVERHEAD_TOKENS = 4_000;
+
+/**
+ * Renders the full document with page markers, for whole-paper mode.
+ *
+ * The output depends only on the PDF, never on the question, which is the
+ * whole point: a question-independent document block means a byte-identical
+ * prompt prefix across turns, which is what lets prompt caching work. See
+ * docs/MODERNIZATION_PLAN_2026.md §4.
+ */
+export function buildWholePaperContext(
+  pages: Array<{ page: number; text: string }>,
+): string {
+  return pages
+    .filter((p) => p.text.trim().length > 0)
+    .map((p) => `[p.${p.page}]\n${p.text.trim()}`)
+    .join("\n\n");
+}
 
 /** Overhead per chunk marker: [c.xxxxxxxx pp.XX-XX]\n...\n[/c.xxxxxxxx] */
 const MARKER_OVERHEAD = 50;
@@ -141,7 +196,13 @@ export async function buildRAGContext(
       return {
         messages,
         chunkWhitelist: new Map(),
-        stats: { totalPages: 0, totalChunks: 0, selectedChunks: 0 },
+        mode: "chunk-rag",
+        stats: {
+          totalPages: 0,
+          totalChunks: 0,
+          selectedChunks: 0,
+          contextTokens: 0,
+        },
       };
     }
 
@@ -150,11 +211,49 @@ export async function buildRAGContext(
       chunks,
       attachmentKey: extraction.attachmentKey,
       totalPages: extraction.totalPages,
+      pages: extraction.pages,
     };
     itemCache.set(item.id, cached);
   }
 
-  const { chunks, totalPages } = cached;
+  const { chunks, totalPages, pages } = cached;
+
+  // --- Step 2b: Whole-paper mode, when the full text fits the budget ---
+  //
+  // Preferred whenever it fits, for two reasons. It is cheaper: the document
+  // block is question-independent, so the prompt prefix is byte-identical
+  // across turns and prompt caching serves it at ~10% of input price from the
+  // second question onwards, instead of re-sending a freshly-selected chunk
+  // set at full price every turn. And it is better: the model sees the entire
+  // paper rather than a keyword-selected subset, so it can answer questions
+  // whose evidence the chunk scorer would have missed.
+  //
+  // The budget already encodes the provider's limits, including Haiku 5.5's
+  // 100K pricing band and the user's Ollama num_ctx, so no separate threshold
+  // is needed here — "fits the budget" is the whole condition.
+  const wholeContext = buildWholePaperContext(pages);
+  const wholeTokens = estimateTokens(wholeContext);
+
+  if (wholeContext && wholeTokens + PROMPT_OVERHEAD_TOKENS <= inputBudget) {
+    return {
+      messages: buildMessages(
+        wholeContext,
+        question,
+        conversationHistory,
+        "whole-paper",
+      ),
+      // Page citations are validated against pageCount, not this map.
+      chunkWhitelist: new Map(),
+      mode: "whole-paper",
+      pageCount: totalPages || pages.length,
+      stats: {
+        totalPages,
+        totalChunks: chunks.length,
+        selectedChunks: chunks.length,
+        contextTokens: wholeTokens,
+      },
+    };
+  }
 
   // --- Step 3: Score chunks (with optional embeddings) ---
   let chunkEmbeddings: Map<string, number[]> | undefined;
@@ -234,15 +333,22 @@ export async function buildRAGContext(
   const context = contextParts.join("\n\n");
 
   // --- Step 6: Build messages ---
-  const messages = buildMessages(context, question, conversationHistory);
+  const messages = buildMessages(
+    context,
+    question,
+    conversationHistory,
+    "chunk-rag",
+  );
 
   return {
     messages,
     chunkWhitelist,
+    mode: "chunk-rag",
     stats: {
       totalPages,
       totalChunks: chunks.length,
       selectedChunks: selected.length,
+      contextTokens: estimateTokens(context),
     },
   };
 }

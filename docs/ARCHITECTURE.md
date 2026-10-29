@@ -159,7 +159,7 @@ appendMessage(itemId, { role, content, sourceChunks })   IndexedDB
 | `src/modules/llm/providers/gemini.ts` | Google Gemini (SSE streaming) |
 | `src/modules/rag/extractor.ts` | PDF text extraction via Zotero.FullText; page splitting; attachment key |
 | `src/modules/rag/chunker.ts` | Paragraph/window text chunking; FNV-1a content-hashed IDs; chunk ID regex |
-| `src/modules/rag/pipeline.ts` | RAG orchestrator: extract → chunk → score → select → build prompt; per-item cache |
+| `src/modules/rag/pipeline.ts` | Context orchestrator: whole-paper mode when the text fits the budget, else chunk-RAG; per-item cache |
 | `src/modules/storage/db.ts` | IndexedDB: conversations, privacy flags, embeddings (Phase D) |
 | `src/modules/ui/readerPanel.ts` | Panel registration + full chat UI wiring; citation parsing; history rendering |
 | `src/modules/ui/onboarding.ts` | First-run consent modal |
@@ -230,6 +230,47 @@ checkPrivacy(provider, itemId):
 ```
 
 ---
+
+## Prompt Caching and Context Modes
+
+The plugin picks one of two context modes per request, in `pipeline.ts`:
+
+| | whole-paper | chunk-rag |
+|---|---|---|
+| When | full text + overhead fits the input budget | it does not |
+| Document block | entire paper, page-marked `[p.N]` | selected chunks, `[c.ID pp.X-Y]` |
+| Stable across turns? | **yes** — question-independent | no — selection depends on the question |
+| Citations | `[p.N]`, validated against page count | `[c.ID]`, validated against the chunk whitelist |
+
+Whole-paper mode exists because the previous design could never hit a prompt
+cache. Chunk scoring depends on the question, so the document block changed
+every turn, so the cacheable prefix changed every turn, and every question
+re-paid full input price for its context. Making the document block
+question-independent is what unlocks caching.
+
+Message order is therefore stable-first:
+
+```
+[system]     guardrails + citation scheme    ─┐ cache breakpoint
+[user]       <document> … paper text …       ─┘ cache breakpoint
+[assistant]  fixed acknowledgement
+[history]    grows each turn
+[user]       the current question              volatile
+```
+
+`LLMMessage.cacheable` marks a breakpoint. Providers interpret it differently:
+
+| Provider | Mechanism |
+|---|---|
+| Anthropic | explicit `cache_control: {type: "ephemeral", ttl: "1h"}`; reads ≈0.1x, writes ≈1.25x |
+| OpenAI | automatic prefix caching — no flag, just needs the prefix to be stable |
+| Gemini | implicit caching, on by default for 2.5+ models |
+| Ollama | no token cost, but llama.cpp reuses the KV cache, so follow-ups are faster |
+
+The diagnostics footer reports `cache N read / M written` when the provider
+supplies it. **If `read` stays at 0 across turns of one conversation, caching
+is not working** — something is invalidating the prefix. `test/caching.test.ts`
+guards the prefix-stability property directly.
 
 ## Citation Safety
 

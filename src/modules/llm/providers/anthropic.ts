@@ -20,6 +20,7 @@ import type {
   LLMMessage,
   ChatOptions,
   StreamChunk,
+  TokenUsage,
 } from "../types";
 import { httpGet, httpPost } from "../../../utils/http";
 
@@ -38,6 +39,16 @@ const DEFAULT_MAX_TOKENS = 16_000;
 /** Default output cap for streaming requests. */
 const DEFAULT_STREAM_MAX_TOKENS = 64_000;
 
+/**
+ * Cache lifetime for the stable prompt prefix.
+ *
+ * A reading session runs over tens of minutes — well past the 5-minute
+ * default — so the longer TTL is what actually produces cache hits on turn 3
+ * and beyond. A 1h write costs more than a 5m write, but one extra write beats
+ * re-sending the whole paper at full price every few questions.
+ */
+const CACHE_TTL = "1h";
+
 /** Connection timeout (ms) for the initial fetch. */
 const CONNECTION_TIMEOUT_MS = 30_000;
 
@@ -50,8 +61,21 @@ export class AnthropicProvider implements ILLMProvider {
 
   private apiKey: string;
 
+  /** Usage from the most recent non-streaming `chat()` call, if reported. */
+  private lastUsage: TokenUsage | undefined;
+
   constructor(apiKey: string) {
     this.apiKey = apiKey;
+  }
+
+  /**
+   * Token accounting from the most recent non-streaming `chat()` call.
+   *
+   * Streaming reports usage on its chunks; `chat()` has no chunk to attach it
+   * to, so the non-stream fallback path reads it from here instead.
+   */
+  lastChatUsage(): TokenUsage | undefined {
+    return this.lastUsage;
   }
 
   /**
@@ -59,9 +83,11 @@ export class AnthropicProvider implements ILLMProvider {
    * System messages are extracted to the top-level `system` field.
    * user/assistant messages go to the `messages` array (roles unchanged).
    *
-   * `system` is sent as an **array of content blocks**, not a bare string.
-   * Functionally identical today, but only the array form can carry
-   * `cache_control`, which Phase 2 needs to cache the stable prompt prefix.
+   * Messages flagged `cacheable` get a `cache_control` breakpoint, which is
+   * why both `system` and message content are emitted as **arrays of content
+   * blocks** rather than bare strings — only the array form can carry it.
+   * The API allows at most 4 breakpoints per request; the message builder
+   * uses 2 (system + document).
    *
    * @param defaultMaxTokens - Output cap when the caller does not set one;
    *   differs between streaming and non-streaming requests.
@@ -72,11 +98,24 @@ export class AnthropicProvider implements ILLMProvider {
     defaultMaxTokens: number = DEFAULT_MAX_TOKENS,
   ) {
     const systemParts: string[] = [];
-    const apiMessages: Array<{ role: string; content: string }> = [];
+    let systemCacheable = false;
+    const apiMessages: Array<{ role: string; content: unknown }> = [];
 
     for (const msg of messages) {
       if (msg.role === "system") {
         systemParts.push(msg.content);
+        if (msg.cacheable) systemCacheable = true;
+      } else if (msg.cacheable) {
+        apiMessages.push({
+          role: msg.role,
+          content: [
+            {
+              type: "text",
+              text: msg.content,
+              cache_control: { type: "ephemeral", ttl: CACHE_TTL },
+            },
+          ],
+        });
       } else {
         apiMessages.push({ role: msg.role, content: msg.content });
       }
@@ -86,7 +125,15 @@ export class AnthropicProvider implements ILLMProvider {
       model: options.model,
       max_tokens: options.maxTokens ?? defaultMaxTokens,
       ...(systemParts.length > 0 && {
-        system: [{ type: "text", text: systemParts.join("\n\n") }],
+        system: [
+          {
+            type: "text",
+            text: systemParts.join("\n\n"),
+            ...(systemCacheable && {
+              cache_control: { type: "ephemeral", ttl: CACHE_TTL },
+            }),
+          },
+        ],
       }),
       ...(options.temperature != null && { temperature: options.temperature }),
       // Omitted unless the user opts in, so the model's own default applies.
@@ -109,6 +156,9 @@ export class AnthropicProvider implements ILLMProvider {
     }
 
     const data = res.json();
+    // Non-streaming has no chunk to carry usage on, so stash it for the
+    // caller to read via lastChatUsage(). Used by the non-stream fallback path.
+    this.lastUsage = this.parseUsage(data.usage);
     return data.content?.[0]?.text ?? "";
   }
 
@@ -153,6 +203,8 @@ export class AnthropicProvider implements ILLMProvider {
 
     const decoder = new TextDecoder();
     let buffer = "";
+    /** Accumulated token accounting; merged across message_start/_delta. */
+    let lastUsage: TokenUsage | undefined;
 
     try {
       while (true) {
@@ -197,8 +249,28 @@ export class AnthropicProvider implements ILLMProvider {
 
           // Terminal: message_stop
           if (eventType === "message_stop") {
-            yield { text: "", done: true };
+            yield { text: "", done: true, ...(lastUsage && { usage: lastUsage }) };
             return;
+          }
+
+          // message_start carries input and cache token counts; message_delta
+          // carries the running output count. Merge rather than replace.
+          if (
+            (eventType === "message_start" || eventType === "message_delta") &&
+            dataStr
+          ) {
+            try {
+              const data = JSON.parse(dataStr) as any;
+              const usage = this.parseUsage(
+                data.message?.usage ?? data.usage,
+              );
+              if (usage) {
+                lastUsage = { ...(lastUsage ?? {}), ...usage };
+                yield { text: "", done: false, usage: lastUsage };
+              }
+            } catch {
+              // Skip malformed SSE events.
+            }
           }
 
           // Content delta
@@ -217,11 +289,34 @@ export class AnthropicProvider implements ILLMProvider {
       }
 
       // Signal completion if stream ended without message_stop.
-      yield { text: "", done: true };
+      yield { text: "", done: true, ...(lastUsage && { usage: lastUsage }) };
     } finally {
       controller.abort();
       try { reader.releaseLock(); } catch { /* ignore */ }
     }
+  }
+
+  /**
+   * Extracts token accounting from an Anthropic `usage` object.
+   *
+   * `cache_read_input_tokens` is the signal that matters: if it stays zero
+   * across turns of one conversation, the cached prefix is being invalidated
+   * somewhere and the caching work is not paying off.
+   */
+  private parseUsage(usage: any): TokenUsage | undefined {
+    if (!usage || typeof usage !== "object") return undefined;
+
+    const out: TokenUsage = {};
+    if (typeof usage.input_tokens === "number")
+      out.inputTokens = usage.input_tokens;
+    if (typeof usage.output_tokens === "number")
+      out.outputTokens = usage.output_tokens;
+    if (typeof usage.cache_read_input_tokens === "number")
+      out.cacheReadTokens = usage.cache_read_input_tokens;
+    if (typeof usage.cache_creation_input_tokens === "number")
+      out.cacheWriteTokens = usage.cache_creation_input_tokens;
+
+    return Object.keys(out).length > 0 ? out : undefined;
   }
 
   async isAvailable(): Promise<boolean> {

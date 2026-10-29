@@ -47,6 +47,16 @@ export interface ChatMessage {
   timestamp: string;
   /** Source chunks referenced in this message (assistant only). */
   sourceChunks?: SourceChunkRef[];
+  /**
+   * Page count of the document this answer was grounded in, for assistant
+   * messages produced in whole-paper mode.
+   *
+   * Acts as the stored page-citation whitelist: when re-rendering history,
+   * `[p.N]` is clickable only for 1 <= N <= pageCount. Absent on chunk-rag
+   * messages (which carry `sourceChunks` instead) and on pre-0.3.0 messages,
+   * where page markers stay non-clickable as before.
+   */
+  pageCount?: number;
 }
 
 /** Reference to a source chunk used in an assistant response. */

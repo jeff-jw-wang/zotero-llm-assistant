@@ -1,7 +1,7 @@
 {
   "name": "zotero-llm-assistant",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AI-powered research assistant for Zotero \u2014 chat with papers, search your library, and jump to cited pages.",
   "config": {
     "addonName": "Zotero LLM Assistant",
@@ -22,6 +22,7 @@
     "build": "zotero-plugin build && tsc --noEmit",
     "test:chunker": "tsx test/chunker.test.ts",
     "test:models": "tsx test/models.test.ts",
+    "test:caching": "tsx test/caching.test.ts",
     "test:phase-c": "tsx test/phase-c.test.ts",
     "test:phase-d": "tsx test/phase-d.test.ts",
     "test:privacy": "tsx test/privacy-fallback.test.ts",
@@ -29,7 +30,7 @@
     "test:qa-fixes": "tsx test/qa-fixes.test.ts",
     "test:v0.1.1b": "tsx test/v0.1.1b.test.ts",
     "release": "zotero-plugin release",
-    "test": "npm run -s test:chunker && npm run -s test:models && npm run -s test:phase-c && npm run -s test:phase-d && npm run -s test:privacy && npm run -s test:privacy-mismatch && npm run -s test:qa-fixes && npm run -s test:v0.1.1b"
+    "test": "npm run -s test:chunker && npm run -s test:models && npm run -s test:caching && npm run -s test:phase-c && npm run -s test:phase-d && npm run -s test:privacy && npm run -s test:privacy-mismatch && npm run -s test:qa-fixes && npm run -s test:v0.1.1b"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",

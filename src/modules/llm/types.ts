@@ -12,6 +12,38 @@
 export interface LLMMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  /**
+   * Marks this message as the end of a stable, cacheable prompt prefix.
+   *
+   * Providers that support explicit prompt caching (Anthropic's
+   * `cache_control`) place a cache breakpoint here; providers with automatic
+   * or implicit caching (OpenAI, Gemini) ignore it and simply benefit from the
+   * prefix being stable; local providers ignore it but get faster follow-ups
+   * from llama.cpp's KV-cache reuse.
+   *
+   * Only set this on content that is byte-identical across turns. Prompt
+   * caching is a prefix match, so one changed byte anywhere before the
+   * breakpoint invalidates everything after it.
+   */
+  cacheable?: boolean;
+}
+
+/**
+ * Token accounting for one request, where the provider reports it.
+ *
+ * Used by the diagnostics footer to show whether prompt caching is actually
+ * working. `cacheReadTokens` staying at zero across turns of one conversation
+ * means something is invalidating the prefix.
+ */
+export interface TokenUsage {
+  /** Uncached input tokens, billed at full rate. */
+  inputTokens?: number;
+  /** Generated output tokens. */
+  outputTokens?: number;
+  /** Input tokens served from cache (~0.1x the input rate). */
+  cacheReadTokens?: number;
+  /** Input tokens written to cache (~1.25x the input rate, once). */
+  cacheWriteTokens?: number;
 }
 
 /** A chunk of streamed output from the LLM. */
@@ -20,6 +52,12 @@ export interface StreamChunk {
   text: string;
   /** True if this is the final chunk (stream is done). */
   done: boolean;
+  /**
+   * Token accounting, when the provider reports it. Arrives incrementally —
+   * input and cache counts typically on the first chunk, output counts on the
+   * last — so callers should merge rather than overwrite.
+   */
+  usage?: TokenUsage;
 }
 
 /** Options passed to a chat completion request. */
