@@ -161,6 +161,78 @@ await test("createProvider() passes the llm.ollama.numCtx preference through", a
 });
 
 // ---------------------------------------------------------------------------
+// D3 — settings buttons must have a label
+// ---------------------------------------------------------------------------
+
+console.log("\n=== D3: settings controls have labels ===\n");
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const FTL = readFileSync(
+  join(ROOT, "addon/locale/en-US/preferences.ftl"),
+  "utf8",
+);
+const XHTML = readFileSync(
+  join(ROOT, "addon/content/preferences.xhtml"),
+  "utf8",
+);
+
+/**
+ * Splits a Fluent file into messages: the inline value (text after `=` on the
+ * first line) and the names of any attributes on the indented lines below it.
+ */
+function parseFtl(source: string): Map<string, { value: string; attrs: string[] }> {
+  const messages = new Map<string, { value: string; attrs: string[] }>();
+  let current: { value: string; attrs: string[] } | undefined;
+  for (const line of source.split("\n")) {
+    const head = /^([a-zA-Z][\w-]*)\s*=\s*(.*)$/.exec(line);
+    if (head) {
+      current = { value: head[2]!.trim(), attrs: [] };
+      messages.set(head[1]!, current);
+      continue;
+    }
+    const attr = /^\s+\.([\w-]+)\s*=/.exec(line);
+    if (attr && current) current.attrs.push(attr[1]!);
+  }
+  return messages;
+}
+
+const ftl = parseFtl(FTL);
+
+/** l10n IDs used on XUL elements that show their text through `label`. */
+const labelled = [...XHTML.matchAll(/<(button|checkbox)\b[^>]*?data-l10n-id="([^"]+)"/g)].map(
+  (m) => ({ tag: m[1]!, id: m[2]! }),
+);
+
+await test("the settings pane has label-bearing controls to check", () => {
+  assert.ok(labelled.length >= 6, `found only ${labelled.length}`);
+  assert.equal(
+    labelled.filter((c) => c.id === "pref-detect-models").length,
+    4,
+    "expected four Detect buttons",
+  );
+});
+
+await test("every button and checkbox message sets .label, not a bare value", () => {
+  // A XUL button shows its `label` attribute. A Fluent message with only a
+  // value sets the element's text content instead, which a button ignores,
+  // leaving it blank.
+  for (const { tag, id } of labelled) {
+    const message = ftl.get(id);
+    assert.ok(message, `<${tag}> uses "${id}", which preferences.ftl does not define`);
+    assert.ok(
+      message.attrs.includes("label"),
+      `"${id}" is used on a <${tag}> but has no .label attribute`,
+    );
+  }
+});
+
+await test("every data-l10n-id in the settings pane is defined", () => {
+  for (const m of XHTML.matchAll(/data-l10n-id="([^"]+)"/g)) {
+    assert.ok(ftl.has(m[1]!), `"${m[1]}" is not defined in preferences.ftl`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
