@@ -32,10 +32,10 @@ about Ollama, Hugging Face and OpenAI were checked against their own sites on
 2. Build the XPI and run the 15-minute runtime checklist in Zotero (§7). Only
    the repository owner can do this — a cloud session has no Zotero.
 3. Fix the P1 defects and adopt the revised context policy (§5.2).
-4. Rebuild library search on a real semantic signal (§5.3). The current one is
-   not semantic in practice (§3, correction 3).
-5. Optionally, add sign-in with a ChatGPT plan (§5.4). This is independent of
-   the steps above and is now officially supported for apps like this one.
+4. Add sign-in with a ChatGPT plan (§5.4, milestone M4). The owner has ChatGPT
+   Plus, and this is now officially supported for apps like this one.
+5. Rebuild library search on a real semantic signal (§5.3, milestone M3). The
+   current one is not semantic in practice (§3, correction 3).
 
 **Four things the first review told you that were wrong** (details in §3):
 
@@ -454,6 +454,8 @@ your own suggestion, implemented directly, and it needs no embeddings.
 
 - Size: roughly 40 tokens per item, so 1,000 items is about 40K tokens. On
   Haiku with caching, each further question costs a small fraction of a cent.
+  The owner's library is about 3,000 items, which changes the default — see
+  the owner's answers in §9.
 - Order the catalog by date added so new items append and most of the cached
   prefix stays valid.
 - Every key in the catalog becomes a valid citation target.
@@ -618,11 +620,15 @@ Scope: §5.3 items 1–3, D12, D16.
 Done when:
 - With an Ollama embedding model installed, a conceptual query with no shared
   words ranks a relevant fixture item first, in a test using recorded vectors.
-- Catalog mode builds a deterministic, append-only catalog (tested), respects
-  private items, and is behind its own consent setting.
+- The shortlist catalog (§9, owner's answers) is the default and the full
+  catalog is an explicit action that shows its size first. Both are
+  deterministic (tested), respect private items, and sit behind their own
+  consent setting.
+- Background embedding of a 3,000-item library reports progress and does not
+  freeze Zotero.
 - Library chat carries conversation history.
 
-### M4 — Sign in with a ChatGPT plan (optional, independent of M2 and M3)
+### M4 — Sign in with a ChatGPT plan (before M3: the owner has ChatGPT Plus)
 
 Scope: §5.4.
 
@@ -635,6 +641,8 @@ Done when:
 - Tokens refresh before expiry, survive a Zotero restart, and are not stored
   in plain-text preferences.
 - Usage-limit and revoked-consent errors show a clear message.
+- An account that cannot use its plan (for example a free account) gets a
+  plain explanation and a pointer to the no-cost options, not a failed request.
 
 ### Later
 
@@ -705,7 +713,7 @@ unchecked.
 | Decision | Status |
 |---|---|
 | Default cloud model: Haiku 5.5 | Kept. Reinforced by §5.1. |
-| Local target: 8 GB laptop, Qwen3.5 4B | Kept, pending the speed measurement in §5.5. |
+| Local target | **Broadened.** The owner uses a Mac, but the plugin must work on many kinds of machine. Design for an 8 GB laptop with no usable GPU as the floor. |
 | Empty model field means "choose automatically" | Kept in principle; the implementation is defective (D1). |
 | Whole-paper mode with a cached prefix | Kept; needs size limits (D6). |
 | "No whole-paper threshold needed" | **Reversed.** |
@@ -715,19 +723,54 @@ unchecked.
 | Subscription login | Not for Claude (MCP route instead). ChatGPT: **now feasible** through the open-source plan-usage flow (M4). |
 | Footer shows token counts, no dollar estimate | Kept. |
 
-### Questions for the owner
+### Owner's answers (12 November 2026) and what they change
 
-1. Is the 8 GB laptop Apple Silicon, or an Intel/AMD machine without a usable
-   GPU? This decides the local design (§5.5).
-2. About how many items are in the library? This sizes catalog mode.
-3. Which Zotero version do you run?
-4. Which providers will you actually use? That sets testing priority.
-5. Is sending the full list of titles and authors to a cloud provider
-   acceptable, with private items excluded?
-6. Do you have a ChatGPT Plus or Pro plan you would want to use from the
-   plugin? If so, M4 can move ahead of M3.
-7. For Claude, would using the Claude desktop app with a Zotero connector
-   satisfy the subscription goal, or does it have to be inside Zotero?
+**"I have a Mac, but it must be usable on many kinds of laptops and devices."**
+The owner's machine is not the design target; the weakest plausible machine is.
+
+- Local defaults assume no usable GPU: small context, stable prefix,
+  `keep_alive`, thinking off (§5.2). Never size a default to the owner's Mac.
+- Do not hardcode one local model. Recommend by memory tier in the settings
+  text and README (`qwen3.5:2b`, `qwen3.5:4b`, larger), and let Detect show
+  what is installed.
+- Tell the user what is happening. After a local answer, use Ollama's counters
+  to report how fast the prompt was read, and when it is slow suggest a smaller
+  context or model instead of leaving them waiting.
+- The runtime check (M0) should cover more than one machine when possible: an
+  Apple Silicon Mac, a machine without a GPU, and Windows.
+
+**"About 3,000 papers."**
+At roughly 40 tokens per item the full catalog is about 120K estimated tokens,
+and more on Claude's tokenizer. That is over Haiku's 100K price band and over
+the whole-context limit proposed in §5.2, so the full catalog on every library
+question is the wrong default at this size.
+
+- Default for M3: a *shortlist catalog*. Retrieval picks the top few hundred
+  items, sent as one title line each, plus abstracts for the top ten.
+- The full catalog becomes an explicit action for survey-style questions, with
+  its size shown first, offered only where it fits the model.
+- Embedding 3,000 items is a visible background job. It needs progress
+  reporting and must not freeze Zotero.
+
+**"I have ChatGPT Plus; some users will be on the free plan."**
+
+- M4 moves ahead of M3, because the owner can test it.
+- OpenAI's developer documentation names Plus and Pro as eligible for plan
+  usage (its help centre also lists Go). A free account can sign in but cannot
+  run requests on its plan. The sign-in flow must detect this — consent is
+  declined, or the granted scopes lack `chatgpt.tokens.use.direct` — and say
+  so plainly, pointing to the options that cost nothing: a local Ollama model
+  or Gemini's free API tier.
+
+### Still open
+
+1. Is the owner's Mac Apple Silicon, and how much memory does it have?
+2. Which Zotero version?
+3. Which other providers matter for testing?
+4. Is sending titles and authors to a cloud provider acceptable, with private
+   items excluded?
+5. For Claude, would the desktop app with a Zotero connector do, or must it be
+   inside Zotero?
 
 ---
 
