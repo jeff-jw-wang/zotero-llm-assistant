@@ -238,6 +238,13 @@ Semantic coverage grows in the background (`startBackgroundEmbedding`), so a
 fresh library starts keyword-only and improves as indexing proceeds;
 `SearchDiagnostics.semanticCovered` reports progress.
 
+**Known limitation.** The "semantic" ranking is only as good as the embedding
+backend. Inside Zotero the Transformers.js backend has been observed to fail
+(commit `d3acbf6`), in which case `HashingRunner` supplies word-and-trigram
+hash vectors — a lexical signal, not a semantic one. Until a real embedding
+backend runs, fusion combines two lexical rankings. See
+`docs/MODERNIZATION_PLAN_2026.md` §3 and §5.3.
+
 ### Embedding method versioning
 
 Vectors are comparable only within one embedding *method*. `EMBEDDING_METHOD_VERSION`
