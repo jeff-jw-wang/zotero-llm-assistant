@@ -24,6 +24,10 @@ import {
   FALLBACK_CONTEXT_WINDOW,
   FALLBACK_LOCAL_CONTEXT_WINDOW,
   DEFAULT_OUTPUT_RESERVE,
+  PREFERRED_MODELS,
+  pickModel,
+  canChat,
+  parseOllamaShow,
 } from "../src/modules/llm/models";
 import { getTopKCapForBudget, AVG_CHUNK_TOKENS } from "../src/utils/tokens";
 
@@ -226,6 +230,182 @@ test("a Haiku 5.5 budget admits far more chunks than the legacy cap did", () => 
     getTopKCapForBudget(budget) > legacyTopK * 4,
     "resolved budget should admit several times the legacy chunk count",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Automatic model selection (plan defect D1)
+// ---------------------------------------------------------------------------
+
+console.log("\n=== Automatic model selection (D1) ===\n");
+
+/**
+ * Model IDs on OpenAI's pricing page, read 2026-11-12. The old name-pattern
+ * logic selected `gpt-realtime-2.1-mini` from this list.
+ */
+const OPENAI_IDS = [
+  "gpt-4.1", "gpt-4.1-2025-04-14", "gpt-4.1-mini", "gpt-4.1-mini-2025-04-14",
+  "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1",
+  "gpt-5.2", "gpt-5.2-pro", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini",
+  "gpt-5.4-nano", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro", "gpt-5.6-luna",
+  "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-astra-law",
+  "gpt-6-cyber", "gpt-6-luna", "gpt-6-rosalind", "gpt-6-sol", "gpt-6.1-sol",
+  "gpt-6.1-terra", "gpt-realtime-2.1", "gpt-realtime-2.1-mini",
+  "gpt-image-2", "text-embedding-3-small", "o4-mini",
+];
+
+/** Illustrative: every one of these supports `generateContent`. */
+const GEMINI_IDS = [
+  "gemini-3.1-flash-image-preview", "gemini-3.1-pro-preview",
+  "gemini-3-flash", "gemini-3-flash-lite", "gemini-2.5-flash-preview-tts",
+];
+
+const ANTHROPIC_IDS = [
+  "claude-3-haiku-20240307", "claude-haiku-4-5-20251001", "claude-haiku-5-5",
+  "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2",
+];
+
+const OLLAMA_NO_QWEN35 = [
+  { id: "qwen3-embedding:0.6b", capabilities: ["embedding"] },
+  { id: "nomic-embed-text:latest", capabilities: ["embedding"] },
+  { id: "gemma3:4b", capabilities: ["completion", "vision"] },
+];
+
+test("OpenAI: picks the preferred chat model, not a realtime model", () => {
+  assert.equal(pickModel("openai", OPENAI_IDS), "gpt-6-luna");
+});
+
+test("OpenAI: without the preferred ID, asks instead of guessing", () => {
+  const ids = OPENAI_IDS.filter((id) => id !== "gpt-6-luna");
+  assert.equal(pickModel("openai", ids), undefined);
+});
+
+test("OpenAI: a look-alike of the preferred ID is not selected", () => {
+  assert.equal(
+    pickModel("openai", ["gpt-6-luna-audio", "gpt-6-luna-2", "gpt-5.6-luna"]),
+    undefined,
+  );
+});
+
+test("Gemini: never picks an image or TTS model by name", () => {
+  const picked = pickModel("gemini", GEMINI_IDS);
+  assert.equal(picked, undefined);
+});
+
+test("Gemini: uses the preferred alias when the provider offers it", () => {
+  assert.equal(
+    pickModel("gemini", [...GEMINI_IDS, "gemini-flash-latest"]),
+    "gemini-flash-latest",
+  );
+});
+
+test("Anthropic: picks Haiku 5.5, not a retired dated Haiku", () => {
+  assert.equal(pickModel("anthropic", ANTHROPIC_IDS), "claude-haiku-5-5");
+});
+
+test("Anthropic: accepts a dated snapshot of the preferred ID, newest first", () => {
+  const ids = [
+    "claude-3-haiku-20240307",
+    "claude-haiku-5-5-20260801",
+    "claude-haiku-5-5-20261001",
+    "claude-sonnet-5-5",
+  ];
+  assert.equal(pickModel("anthropic", ids), "claude-haiku-5-5-20261001");
+});
+
+test("Anthropic: only retired/unknown models on offer means no pick", () => {
+  assert.equal(
+    pickModel("anthropic", ["claude-3-haiku-20240307", "claude-opus-4-1"]),
+    undefined,
+  );
+});
+
+test("Ollama: never picks an embedding model; takes the one chat model", () => {
+  assert.equal(pickModel("ollama", OLLAMA_NO_QWEN35), "gemma3:4b");
+});
+
+test("Ollama: prefers qwen3.5:4b, then qwen3.5:2b", () => {
+  const both = [
+    { id: "llama3.2:latest", capabilities: ["completion"] },
+    { id: "qwen3.5:2b", capabilities: ["completion", "thinking"] },
+    { id: "qwen3.5:4b", capabilities: ["completion", "thinking", "vision"] },
+  ];
+  assert.equal(pickModel("ollama", both), "qwen3.5:4b");
+  assert.equal(pickModel("ollama", both.slice(0, 2)), "qwen3.5:2b");
+});
+
+test("Ollama: a preferred ID that reports no chat capability is skipped", () => {
+  assert.equal(
+    pickModel("ollama", [{ id: "qwen3.5:4b", capabilities: ["embedding"] }]),
+    undefined,
+  );
+});
+
+test("Ollama: several chat models and no preferred one means no pick", () => {
+  const models = [
+    { id: "gemma3:4b", capabilities: ["completion"] },
+    { id: "llama3.2:latest", capabilities: ["completion"] },
+  ];
+  assert.equal(pickModel("ollama", models), undefined);
+});
+
+test("Ollama: only embedding models installed means no pick", () => {
+  assert.equal(pickModel("ollama", OLLAMA_NO_QWEN35.slice(0, 2)), undefined);
+});
+
+test("Ollama: capabilities unreported — one model is taken, several are not", () => {
+  assert.equal(pickModel("ollama", ["mistral:latest"]), "mistral:latest");
+  assert.equal(
+    pickModel("ollama", ["mistral:latest", "qwen3-embedding:0.6b"]),
+    undefined,
+  );
+});
+
+test("an unknown model beside a known embedding model is not assumed to chat", () => {
+  assert.equal(
+    pickModel("ollama", [
+      { id: "mystery:latest" },
+      { id: "all-minilm:latest", capabilities: ["embedding"] },
+    ]),
+    undefined,
+  );
+});
+
+test("custom endpoint: a single served model is used; otherwise no pick", () => {
+  assert.equal(pickModel("custom", ["local-model"]), "local-model");
+  assert.equal(pickModel("custom", ["a", "b"]), undefined);
+});
+
+test("no models means no pick, for every provider", () => {
+  for (const p of Object.keys(PREFERRED_MODELS) as Array<
+    keyof typeof PREFERRED_MODELS
+  >) {
+    assert.equal(pickModel(p, []), undefined);
+  }
+});
+
+test("canChat distinguishes yes, no and not-reported", () => {
+  assert.equal(canChat({ capabilities: ["completion", "vision"] }), true);
+  assert.equal(canChat({ capabilities: ["embedding"] }), false);
+  assert.equal(canChat({}), undefined);
+});
+
+test("parseOllamaShow reads capabilities and the context length", () => {
+  // Shape from Ollama's "show model details" API reference.
+  const parsed = parseOllamaShow({
+    capabilities: ["completion", "thinking", "vision"],
+    model_info: {
+      "general.architecture": "qwen35",
+      "qwen35.context_length": 262144,
+      "qwen35.embedding_length": 2560,
+    },
+  });
+  assert.deepEqual(parsed.capabilities, ["completion", "thinking", "vision"]);
+  assert.equal(parsed.contextWindow, 262144);
+});
+
+test("parseOllamaShow tolerates an older Ollama with no capabilities", () => {
+  assert.deepEqual(parseOllamaShow({ model_info: {} }), {});
+  assert.deepEqual(parseOllamaShow(undefined), {});
 });
 
 // ---------------------------------------------------------------------------

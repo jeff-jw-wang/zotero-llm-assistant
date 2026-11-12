@@ -23,7 +23,7 @@ import { validateEndpointURL, preflightDNSCheck } from "../../utils/url";
 import { isModelReady, isModelRevisionCurrent, ensureModelReady, disposeEmbedder } from "../rag/embedder";
 import { OllamaProvider } from "../llm/providers/ollama";
 import { httpGet } from "../../utils/http";
-import { listModels, clearModelCache } from "../llm/models";
+import { listModels, clearModelCache, pickModel } from "../llm/models";
 import { resolveModelId } from "../llm/client";
 
 const ID = (suffix: string) => `zotero-prefpane-${config.addonRef}-${suffix}`;
@@ -301,7 +301,7 @@ function bindModelDetect(
         ? `Using pinned: ${current}.`
         : autoPick
           ? `Auto-selected: ${autoPick}.`
-          : "";
+          : "No automatic choice \u2014 enter one of these in the Model field.";
 
       setStatus(
         `${models.length} model${models.length === 1 ? "" : "s"} available. ` +
@@ -406,10 +406,18 @@ async function refreshOllamaEnvironmentStatus(doc: Document): Promise<void> {
         if (installBtn) installBtn.hidden = true;
         return;
       }
+      const picked = pickModel("ollama", installed);
+      if (!picked) {
+        statusEl.style.color = "#b45309";
+        statusEl.textContent =
+          `Ollama is running at ${endpoint} with ${installed.length} models, ` +
+          "but none is a default choice. Enter the one to use in the Model field.";
+        if (installBtn) installBtn.hidden = true;
+        return;
+      }
       statusEl.style.color = "#16a34a";
       statusEl.textContent =
-        `✓ Ollama is ready at ${endpoint} (${installed.length} model` +
-        `${installed.length === 1 ? "" : "s"} installed, auto-selected).`;
+        `✓ Ollama is ready at ${endpoint} (auto-selected: ${picked}).`;
       if (installBtn) installBtn.hidden = true;
       return;
     }

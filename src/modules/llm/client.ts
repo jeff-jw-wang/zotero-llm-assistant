@@ -29,7 +29,12 @@ import { AnthropicProvider } from "./providers/anthropic";
 import * as prefs from "../../prefs";
 import { isItemPrivate } from "../storage/db";
 import { validateEndpointURL } from "../../utils/url";
-import { listModels, resolveInputBudget, resolveContextWindow } from "./models";
+import {
+  listModels,
+  pickModel,
+  resolveInputBudget,
+  resolveContextWindow,
+} from "./models";
 
 /**
  * How the paper was supplied to the model, which decides the citation scheme.
@@ -190,46 +195,15 @@ function providerCredentials(provider: prefs.ProviderName): {
 }
 
 /**
- * Model-preference patterns per provider, best first.
- *
- * Used only when the user has not pinned a model (the pref is empty), to pick
- * a sensible one from whatever the provider currently offers. This is how the
- * plugin avoids shipping hardcoded model IDs that go stale between releases.
- *
- * Within a pattern, the highest version number wins, so a newer model is
- * preferred automatically as providers ship them.
- */
-const MODEL_PREFERENCE: Record<prefs.ProviderName, RegExp[]> = {
-  // Tuned for paper Q&A on modest hardware: long context and good
-  // instruction-following matter more than raw reasoning benchmarks, and a
-  // mixture-of-experts model gives large-model quality at small-model speed.
-  ollama: [/qwen3\.5/, /qwen3/, /gpt-oss/, /phi-4/, /gemma/, /llama/, /mistral/],
-  // Cheapest tier first — grounded Q&A over supplied text does not need Opus.
-  anthropic: [/haiku/, /sonnet/, /opus/],
-  // Flash over Pro for cost; full Flash over Flash-Lite for quality.
-  gemini: [/flash(?!-lite)/, /flash/, /pro/],
-  openai: [/mini/, /^gpt-5/, /^gpt-/],
-  custom: [/./],
-};
-
-/** Extracts a crude numeric version from a model ID, for "newest wins". */
-function versionScore(id: string): number {
-  const nums = id.match(/\d+(?:\.\d+)?/g);
-  if (!nums) return 0;
-  // Weight the first two numbers so 5.5 beats 5, and 5 beats 4.8.
-  const major = parseFloat(nums[0]!) || 0;
-  const minor = nums[1] ? parseFloat(nums[1]!) || 0 : 0;
-  return major * 100 + minor;
-}
-
-/**
  * Resolves the model ID to use for the active provider.
  *
- * If the user pinned one in Settings, that wins. Otherwise the best available
- * model is picked from provider discovery using {@link MODEL_PREFERENCE}.
+ * If the user pinned one in Settings, that wins. Otherwise `pickModel()`
+ * chooses from provider discovery — an exact preferred ID, or the only chat
+ * model on offer — and never guesses from a model's name.
  *
- * @throws Error with actionable guidance if nothing can be resolved — for
- *   Ollama this is the common "installed no models yet" case.
+ * @throws Error with actionable guidance if nothing can be resolved: no models
+ *   at all (for Ollama, the common "installed no models yet" case), or several
+ *   models with no safe default, in which case the user is asked to choose.
  */
 export async function resolveModelId(
   provider: prefs.ProviderName = prefs.getActiveProvider(),
@@ -254,26 +228,29 @@ export async function resolveModelId(
   const creds = providerCredentials(provider);
   const available = await listModels(provider, creds);
 
-  for (const pattern of MODEL_PREFERENCE[provider]) {
-    const matches = available.filter((m) => pattern.test(m.id.toLowerCase()));
-    if (matches.length > 0) {
-      matches.sort((a, b) => versionScore(b.id) - versionScore(a.id));
-      return matches[0]!.id;
+  const picked = pickModel(provider, available);
+  if (picked) return picked;
+
+  if (available.length === 0) {
+    if (provider === "ollama") {
+      throw new Error(
+        "No Ollama chat models found. Install one first, e.g. " +
+          "`ollama pull qwen3.5:4b` (a good fit for 8 GB machines), then " +
+          "reopen this panel.",
+      );
     }
-  }
-
-  // Nothing matched a preference pattern — take whatever exists.
-  if (available.length > 0) return available[0]!.id;
-
-  if (provider === "ollama") {
     throw new Error(
-      "No Ollama models found. Install one first, e.g. `ollama pull qwen3.5:4b` " +
-        "(a good fit for 8GB machines), then reopen this panel.",
+      `Could not list models for ${provider}. Check the API key and ` +
+        "endpoint in Settings > LLM Assistant, or type a model name there.",
     );
   }
+
+  // Models exist but none is a known-safe default. Ask rather than guess: a
+  // wrong guess here is how a realtime-audio or image model gets selected.
   throw new Error(
-    `Could not determine a model for ${provider}. Set one explicitly in ` +
-      "Settings > LLM Assistant.",
+    `Could not choose a ${provider} model automatically ` +
+      `(${available.length} available). Open Settings > LLM Assistant, press ` +
+      "Detect to see them, and enter the one to use in the Model field.",
   );
 }
 

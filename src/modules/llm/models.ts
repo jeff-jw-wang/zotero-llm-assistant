@@ -47,6 +47,12 @@ export interface ModelInfo {
   maxOutputTokens?: number;
   /** Whether the model runs locally (no network, no per-token cost). */
   isLocal: boolean;
+  /**
+   * What the model can do, when the provider reports it. Ollama's `/api/show`
+   * returns values such as `completion`, `thinking`, `vision` and `embedding`.
+   * `undefined` means "not reported", which is different from "cannot chat".
+   */
+  capabilities?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +129,115 @@ const FAMILY_WINDOWS: Array<{ pattern: RegExp; window: number }> = [
   { pattern: /^(gpt-4o|gpt-4-turbo)/, window: 128_000 },
   { pattern: /^o[134]/, window: 200_000 },
 ];
+
+// ---------------------------------------------------------------------------
+// Automatic model selection
+// ---------------------------------------------------------------------------
+
+/**
+ * Exact model IDs to use when the user has not pinned a model, best first.
+ *
+ * These are exact IDs on purpose. The previous implementation matched loose
+ * name patterns (`/mini/`, `/flash/`, `/qwen3/`) and ranked matches by the
+ * numbers in the ID. Against real model lists that selected a realtime audio
+ * model for OpenAI, an image model for Gemini, a retired model for Anthropic
+ * and an embedding model for Ollama. Providers rename their tiers faster than
+ * any pattern can follow, and a pattern that goes stale picks a *wrong* model.
+ *
+ * An exact list also goes stale, but it fails safely: when none of these IDs
+ * is offered, {@link pickModel} returns `undefined` and the user is asked to
+ * choose from the Detect list.
+ *
+ * Each entry is the cheapest current chat tier — grounded Q&A over supplied
+ * text does not need a frontier model. Checked 2026-11-12: `gpt-6-luna`
+ * against OpenAI's pricing page; `qwen3.5:4b` / `qwen3.5:2b` against Ollama's
+ * library (the 4B fits an 8 GB machine, the 2B is the fallback for it).
+ * `claude-haiku-5-5` is from Anthropic's API reference dated 2026-10-06.
+ * `gemini-flash-latest` is NOT verified (Google's documentation was not
+ * reachable); it is safe to list because it is only used if the provider
+ * itself offers that exact ID.
+ */
+export const PREFERRED_MODELS: Record<ProviderName, readonly string[]> = {
+  ollama: ["qwen3.5:4b", "qwen3.5:2b"],
+  anthropic: ["claude-haiku-5-5"],
+  openai: ["gpt-6-luna"],
+  gemini: ["gemini-flash-latest"],
+  custom: [],
+};
+
+/** Minimal view of a model that {@link pickModel} needs. */
+export type ModelCandidate = string | Pick<ModelInfo, "id" | "capabilities">;
+
+/**
+ * Whether a discovered model can hold a chat, as far as the provider says.
+ *
+ * @returns `true` / `false` when capabilities are reported, `undefined` when
+ *   they are not (cloud providers, and Ollama versions without the field).
+ */
+export function canChat(
+  model: Pick<ModelInfo, "capabilities">,
+): boolean | undefined {
+  if (!model.capabilities) return undefined;
+  return model.capabilities.includes("completion");
+}
+
+/**
+ * Whether `id` is `preferred` itself or a dated snapshot of it
+ * (`claude-haiku-5-5-20261001`). Nothing looser: `gpt-6-luna-audio` must not
+ * match `gpt-6-luna`.
+ */
+function matchesPreferred(id: string, preferred: string): boolean {
+  if (id === preferred) return true;
+  return (
+    id.startsWith(`${preferred}-`) &&
+    /^\d{8}$/.test(id.slice(preferred.length + 1))
+  );
+}
+
+/**
+ * Chooses a model for a provider from the models it offers, or `undefined`
+ * when no safe choice exists and the user should pick one.
+ *
+ * Rules, in order:
+ *   1. Models the provider says cannot chat are never chosen.
+ *   2. The first entry of {@link PREFERRED_MODELS} that is offered wins. The
+ *      un-dated ID beats a dated snapshot; among snapshots the newest wins.
+ *   3. If exactly one model is known to chat (or, where capabilities are not
+ *      reported at all, exactly one model exists), use it. This covers a local
+ *      or OpenAI-compatible server with a single model loaded.
+ *   4. Otherwise `undefined`. Never guess from a name.
+ *
+ * Pure: no network, no preferences.
+ *
+ * @param provider - Provider whose preference list applies.
+ * @param models - Offered models, as IDs or as discovery results.
+ */
+export function pickModel(
+  provider: ProviderName,
+  models: readonly ModelCandidate[],
+): string | undefined {
+  const all = models.map((m) =>
+    typeof m === "string" ? { id: m, capabilities: undefined } : m,
+  );
+  const eligible = all.filter((m) => canChat(m) !== false);
+
+  for (const preferred of PREFERRED_MODELS[provider]) {
+    const matches = eligible
+      .map((m) => m.id)
+      .filter((id) => matchesPreferred(id, preferred));
+    if (matches.includes(preferred)) return preferred;
+    if (matches.length > 0) return matches.sort().reverse()[0];
+  }
+
+  const knownChat = eligible.filter((m) => canChat(m) === true);
+  if (knownChat.length === 1) return knownChat[0]!.id;
+  // A lone model with unreported capabilities is only safe to take when
+  // nothing else was offered — one unknown beside known non-chat models could
+  // be anything.
+  if (all.length === 1 && eligible.length === 1) return eligible[0]!.id;
+
+  return undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Discovery cache
@@ -297,8 +412,8 @@ export async function resolveContextWindow(
 
   // Ollama reports context length per model via /api/show, not /api/tags.
   if (provider === "ollama" && opts.endpoint) {
-    const shown = await showOllamaContextLength(opts.endpoint, modelId);
-    if (shown) return shown;
+    const shown = await showOllamaModel(opts.endpoint, modelId);
+    if (shown.contextWindow) return shown.contextWindow;
   }
 
   return inferContextWindow(provider, modelId);
@@ -308,7 +423,16 @@ export async function resolveContextWindow(
 // Per-provider discovery
 // ---------------------------------------------------------------------------
 
-/** Ollama: `GET /api/tags` lists locally installed models. */
+/**
+ * Ollama: `GET /api/tags` lists locally installed models, and `POST /api/show`
+ * says what each can do.
+ *
+ * Models that report capabilities without `completion` (embedding models) are
+ * dropped: they cannot answer a chat request, so neither auto-selection nor
+ * the Detect list should offer them. Models whose capabilities are unknown
+ * (an older Ollama, or a failed `/api/show`) are kept and left for
+ * {@link pickModel} to treat conservatively.
+ */
 async function listOllamaModels(endpoint: string): Promise<ModelInfo[]> {
   if (!endpoint) return [];
 
@@ -316,28 +440,66 @@ async function listOllamaModels(endpoint: string): Promise<ModelInfo[]> {
   if (!res.ok) return [];
 
   const body = res.json();
-  const entries: any[] = Array.isArray(body?.models) ? body.models : [];
+  const entries: any[] = (Array.isArray(body?.models) ? body.models : []).filter(
+    (m: any) => typeof m?.name === "string",
+  );
 
-  return entries
-    .filter((m) => typeof m?.name === "string")
-    .map((m) => {
+  const models = await Promise.all(
+    entries.map(async (m): Promise<ModelInfo> => {
       const size = m?.details?.parameter_size;
+      const shown = await showOllamaModel(endpoint, m.name as string);
       return {
         id: m.name as string,
         label: size ? `${m.name} (${size})` : (m.name as string),
         isLocal: true,
+        ...(shown.contextWindow && { contextWindow: shown.contextWindow }),
+        ...(shown.capabilities && { capabilities: shown.capabilities }),
       };
-    });
+    }),
+  );
+
+  return models.filter((m) => canChat(m) !== false);
 }
 
 /**
- * Ollama: `POST /api/show` reports the model's trained context length under an
- * architecture-prefixed key, e.g. `qwen3.context_length`.
+ * Parses an Ollama `/api/show` response body.
+ *
+ * The trained context length sits under an architecture-prefixed key in
+ * `model_info`, e.g. `qwen3.context_length`. `capabilities` is a list of
+ * strings such as `completion`, `thinking`, `vision`, `embedding`.
+ *
+ * Pure, so it can be tested against recorded responses.
  */
-async function showOllamaContextLength(
+export function parseOllamaShow(body: any): {
+  contextWindow?: number;
+  capabilities?: string[];
+} {
+  const out: { contextWindow?: number; capabilities?: string[] } = {};
+
+  if (Array.isArray(body?.capabilities)) {
+    out.capabilities = body.capabilities.filter(
+      (c: unknown): c is string => typeof c === "string",
+    );
+  }
+
+  const info = body?.model_info;
+  if (info && typeof info === "object") {
+    for (const [k, v] of Object.entries(info)) {
+      if (k.endsWith(".context_length") && typeof v === "number" && v > 0) {
+        out.contextWindow = v;
+        break;
+      }
+    }
+  }
+
+  return out;
+}
+
+/** Ollama: `POST /api/show` for one model. Never throws. */
+async function showOllamaModel(
   endpoint: string,
   modelId: string,
-): Promise<number | undefined> {
+): Promise<{ contextWindow?: number; capabilities?: string[] }> {
   try {
     const res = await httpPost(
       `${endpoint}/api/show`,
@@ -345,20 +507,12 @@ async function showOllamaContextLength(
       { "Content-Type": "application/json" },
       DISCOVERY_TIMEOUT_MS,
     );
-    if (!res.ok) return undefined;
-
-    const info = res.json()?.model_info;
-    if (!info || typeof info !== "object") return undefined;
-
-    for (const [k, v] of Object.entries(info)) {
-      if (k.endsWith(".context_length") && typeof v === "number" && v > 0) {
-        return v;
-      }
-    }
+    if (!res.ok) return {};
+    return parseOllamaShow(res.json());
   } catch {
-    // Fall through to inference.
+    // Fall through to inference / unknown capabilities.
+    return {};
   }
-  return undefined;
 }
 
 /**
