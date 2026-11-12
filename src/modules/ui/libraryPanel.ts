@@ -41,6 +41,7 @@ import {
   type ConversationSummary,
   type SourceChunkRef,
 } from "../storage/db";
+import { clearCoreSelection } from "../rag/pipeline";
 import { exportConversationAsMarkdown } from "../../utils/export";
 import { estimateTokens } from "../../utils/tokens";
 import * as prefs from "../../prefs";
@@ -624,6 +625,8 @@ async function renderConversationBody(
 
     try {
       await deleteConversation(itemId);
+      // A cleared conversation starts over with a freshly chosen core.
+      clearCoreSelection(itemId);
       // Re-render the history tab to reflect deletion.
       renderHistoryTab(historyContainer, doc);
     } catch (err: any) {

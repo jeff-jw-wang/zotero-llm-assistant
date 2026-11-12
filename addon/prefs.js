@@ -28,6 +28,10 @@ pref("llm.custom.endpoint", "");
 pref("llm.custom.apiKey", "");
 pref("llm.custom.model", "");
 
+// --- Context size limits (estimated tokens; 0 = automatic) ---
+pref("context.wholePaperMaxTokens", 0);  // largest document sent whole
+pref("context.retrievedMaxTokens", 0);   // largest retrieved-sections context
+
 pref("embeddings.methodVersion", 0);  // bumped by embedder to invalidate stale vectors
 
 // --- UI ---

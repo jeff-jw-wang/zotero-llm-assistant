@@ -95,6 +95,39 @@ export function setOllamaNumCtx(numCtx: number): void {
   setPref("llm.ollama.numCtx", numCtx);
 }
 
+// --- Context size limits ---
+
+function getTokenLimitPref(key: string): number {
+  const raw = getPref(key);
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Largest document sent to the model whole, in estimated tokens.
+ * `0` means automatic: a provider default from `planPrompt()`. A document
+ * above the limit is answered from retrieved sections instead.
+ */
+export function getWholePaperMaxTokens(): number {
+  return getTokenLimitPref("context.wholePaperMaxTokens");
+}
+
+export function setWholePaperMaxTokens(tokens: number): void {
+  setPref("context.wholePaperMaxTokens", Math.max(0, Math.floor(tokens)));
+}
+
+/**
+ * Largest retrieved-sections context, in estimated tokens. `0` means
+ * automatic. Bounds the cost of one question about a very large document.
+ */
+export function getRetrievedMaxTokens(): number {
+  return getTokenLimitPref("context.retrievedMaxTokens");
+}
+
+export function setRetrievedMaxTokens(tokens: number): void {
+  setPref("context.retrievedMaxTokens", Math.max(0, Math.floor(tokens)));
+}
+
 // --- Gemini ---
 export function getGeminiApiKey(): string {
   return (getPref("llm.gemini.apiKey") as string) || "";

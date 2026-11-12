@@ -9,27 +9,35 @@
  *
  * Two context modes:
  *
- *   **whole-paper** — chosen whenever the full text fits the input budget.
- *   The document is sent once, page-marked and unchanged, behind a prompt-cache
- *   breakpoint. Cheaper (cache reads are ~10% of input price, versus re-sending
- *   a freshly-selected chunk set at full price every turn) and better (the
- *   model sees the whole paper, not a keyword-selected subset). Citations are
+ *   **whole-paper** — chosen when the full text is no larger than the plan's
+ *   whole-paper limit (`PromptPlan.wholePaperMax`). The document is sent once,
+ *   page-marked and unchanged, behind a prompt-cache breakpoint. Citations are
  *   page numbers, validated against the page count.
  *
- *   **chunk-rag** — the fallback for documents too large for the budget, and
- *   for local models whose num_ctx is small. Selection still depends on the
- *   question, so this mode does not benefit from prefix caching; that is an
- *   accepted trade, since relevance matters more than cache hits when the
- *   document cannot fit and local inference costs nothing per token.
+ *   **chunk-rag** — for larger documents and small local contexts. Sections
+ *   are sent in two parts (docs/MODERNIZATION_PLAN_2026.md §5.2):
+ *
+ *     - a **core**, chosen once per conversation (structural sections plus the
+ *       best matches for the first question), placed in the cached document
+ *       message and never changed afterwards;
+ *     - a **supplement** of a few sections specific to the current question
+ *       that are not in the core, attached to the question message and
+ *       replaced every turn.
+ *
+ *   The prompt prefix therefore stays byte-identical across turns in both
+ *   modes, so cloud caching works on large documents and Ollama can reuse its
+ *   prompt state on follow-ups, while each question still gets targeted text.
+ *
+ * In both modes the document block is sized from the model and the settings
+ * only. Conversation history is what gives way when space is short: the
+ * oldest messages are dropped until the whole prompt fits.
  *
  * Flow:
  *   1. Extract PDF text (cached per item to avoid re-extraction)
  *   2. Chunk pages into ~512-token segments with content-hashed IDs
- *   2b. If the whole paper fits the budget, return whole-paper mode here
- *   3. Score chunks by keyword overlap + structural priority
- *   4. Greedily select top chunks within the resolved input budget
- *   5. Build context string with chunk markers [c.ID pp.X-Y]
- *   6. Assemble full LLM message array via client.buildMessages()
+ *   3. Load or compute chunk embeddings, when an embedding model is ready
+ *   4. `assembleContext()` — pure: choose the mode, the core and supplement,
+ *      trim history, build the messages
  *
  * Caching:
  *   Extraction + chunking results are cached in-memory per Zotero item ID.
@@ -45,9 +53,19 @@
 
 import { extractPDF } from "./extractor";
 import { chunkPages, type Chunk } from "./chunker";
-import { buildMessages, type ContextMode } from "../llm/client";
+import {
+  buildMessages,
+  getSystemPrompt,
+  type ContextMode,
+} from "../llm/client";
 import { getTopKCapForBudget, estimateTokens } from "../../utils/tokens";
 import type { LLMMessage } from "../llm/types";
+import {
+  fitHistory,
+  messageTokens,
+  promptTokens,
+  type PromptPlan,
+} from "../llm/budget";
 import {
   isModelReady,
   embedText,
@@ -101,7 +119,27 @@ export interface PipelineResult {
     selectedChunks: number;
     /** Estimated input tokens of the document block actually sent. */
     contextTokens: number;
+    /** Sections attached to this question only (chunk-rag mode). */
+    supplementChunks: number;
+    /** Earlier messages left out so the prompt fits. */
+    historyDropped: number;
+    /** Estimated tokens of the whole assembled prompt. */
+    promptTokens: number;
   };
+  /**
+   * The stable core chosen for this conversation (chunk-rag mode). Pass it
+   * back as `previousCore` on the next turn so the document block is rebuilt
+   * identically.
+   */
+  core?: CoreSelection;
+}
+
+/** The sections fixed into a conversation's cached document block. */
+export interface CoreSelection {
+  /** Chunk IDs, in the order they were selected. */
+  chunkIds: string[];
+  /** The `PromptPlan.coreMax` the selection was made for. */
+  coreMax: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +156,21 @@ interface CacheEntry {
 
 const itemCache = new Map<number, CacheEntry>();
 
+/** The core selection of each item's current conversation. Session-only. */
+const coreCache = new Map<number, CoreSelection>();
+
+/**
+ * Forgets the core selection for an item (or all items), so the next question
+ * chooses a fresh one. Call when a conversation is cleared.
+ */
+export function clearCoreSelection(itemId?: number): void {
+  if (itemId !== undefined) {
+    coreCache.delete(itemId);
+  } else {
+    coreCache.clear();
+  }
+}
+
 /**
  * Clears the cached extraction/chunks for a given item, or the entire cache
  * if no item ID is provided. Call this if a PDF is re-indexed or its content
@@ -129,6 +182,7 @@ export function clearItemCache(itemId?: number): void {
   } else {
     itemCache.clear();
   }
+  clearCoreSelection(itemId);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,12 +191,11 @@ export function clearItemCache(itemId?: number): void {
 
 const CHARS_PER_TOKEN = 4;
 
-/**
- * Headroom reserved, inside the input budget, for the system prompt,
- * conversation history and the question itself. Whole-paper mode is chosen
- * only if the full text fits with this much room to spare.
- */
-const PROMPT_OVERHEAD_TOKENS = 4_000;
+/** Most sections attached to a single question as its supplement. */
+const MAX_SUPPLEMENT_CHUNKS = 3;
+
+/** The fixed assistant turn `buildMessages()` adds after a document. */
+const ACK_OVERHEAD_TOKENS = 30;
 
 /**
  * Renders the full document with page markers, for whole-paper mode.
@@ -168,23 +221,215 @@ const MARKER_OVERHEAD = 50;
 // Public API
 // ---------------------------------------------------------------------------
 
+/** Renders chunks with their citation markers, in page order. */
+function renderChunks(
+  chunks: Chunk[],
+  whitelist: Map<string, ChunkMeta>,
+): string {
+  const ordered = [...chunks].sort(
+    (a, b) => a.pageStart - b.pageStart || a.pageEnd - b.pageEnd,
+  );
+  const parts: string[] = [];
+  for (const chunk of ordered) {
+    const pageRange =
+      chunk.pageStart === chunk.pageEnd
+        ? `p.${chunk.pageStart}`
+        : `pp.${chunk.pageStart}-${chunk.pageEnd}`;
+    parts.push(`[c.${chunk.id} ${pageRange}]\n${chunk.text}\n[/c.${chunk.id}]`);
+    whitelist.set(chunk.id, {
+      pageStart: chunk.pageStart,
+      pageEnd: chunk.pageEnd,
+      excerpt: chunk.text.slice(0, 80).replace(/\n/g, " "),
+    });
+  }
+  return parts.join("\n\n");
+}
+
+/** Inputs to {@link assembleContext}. */
+export interface AssembleInput {
+  /** Extracted pages, for whole-paper mode. */
+  pages: Array<{ page: number; text: string }>;
+  /** The same text, chunked, for chunk-rag mode. */
+  chunks: Chunk[];
+  totalPages: number;
+  question: string;
+  /** Earlier messages, oldest first, without the current question. */
+  history: LLMMessage[];
+  /** Allowances from `planPrompt()`. */
+  plan: PromptPlan;
+  /** Core chosen earlier in this conversation, if any. */
+  previousCore?: CoreSelection;
+  /** Chunk vectors and the question vector, when embeddings are available. */
+  chunkEmbeddings?: Map<string, number[]>;
+  questionEmbedding?: number[];
+}
+
+/**
+ * Builds the messages for one question from already-extracted text.
+ *
+ * Pure: no Zotero, no network, no storage. Given the same inputs it returns
+ * the same messages, which is what makes the cached prefix testable.
+ *
+ * The core is reused from `previousCore` when the conversation is continuing
+ * (`history` is non-empty), it was chosen for the same `plan.coreMax`, and all
+ * of its chunks still exist. Otherwise a new core is chosen from this
+ * question — a new conversation, a changed model or setting, or a re-indexed
+ * PDF.
+ */
+export function assembleContext(input: AssembleInput): PipelineResult {
+  const { pages, chunks, totalPages, question, history, plan } = input;
+
+  const systemAndQuestion = (mode: ContextMode, supplementTokens: number) =>
+    messageTokens({ content: getSystemPrompt(mode) }) +
+    messageTokens({ content: question }) +
+    supplementTokens +
+    ACK_OVERHEAD_TOKENS;
+
+  const finish = (
+    mode: ContextMode,
+    documentText: string,
+    supplementText: string,
+    rest: Omit<PipelineResult, "messages" | "mode" | "stats"> & {
+      stats: Omit<
+        PipelineResult["stats"],
+        "contextTokens" | "historyDropped" | "promptTokens"
+      >;
+    },
+  ): PipelineResult => {
+    const contextTokens = estimateTokens(documentText);
+    const supplementTokens = supplementText
+      ? estimateTokens(supplementText)
+      : 0;
+    const historyMax =
+      plan.promptCapacity -
+      contextTokens -
+      systemAndQuestion(mode, supplementTokens);
+    const kept = fitHistory(history, historyMax);
+    const messages = buildMessages(
+      documentText,
+      question,
+      kept,
+      mode,
+      supplementText,
+    );
+    return {
+      ...rest,
+      messages,
+      mode,
+      stats: {
+        ...rest.stats,
+        contextTokens,
+        historyDropped: history.length - kept.length,
+        promptTokens: promptTokens(messages),
+      },
+    };
+  };
+
+  // --- Whole-paper mode: the full text is within the whole-paper limit ---
+  //
+  // The limit comes from the model and the settings only, so the decision is
+  // the same on every turn and the document block never changes.
+  const wholeContext = buildWholePaperContext(pages);
+  const wholeTokens = estimateTokens(wholeContext);
+
+  if (wholeContext && wholeTokens <= plan.wholePaperMax) {
+    return finish("whole-paper", wholeContext, "", {
+      // Page citations are validated against pageCount, not this map.
+      chunkWhitelist: new Map(),
+      pageCount: totalPages || pages.length,
+      stats: {
+        totalPages,
+        totalChunks: chunks.length,
+        selectedChunks: chunks.length,
+        supplementChunks: 0,
+      },
+    });
+  }
+
+  // --- Chunk-rag mode: stable core + per-question supplement ---
+  const scored = scoreChunks(
+    chunks,
+    question,
+    input.chunkEmbeddings,
+    input.questionEmbedding,
+  );
+  const byId = new Map(chunks.map((c) => [c.id, c]));
+
+  const previous = input.previousCore;
+  const reusable =
+    previous !== undefined &&
+    history.length > 0 &&
+    previous.coreMax === plan.coreMax &&
+    previous.chunkIds.every((id) => byId.has(id));
+
+  let coreChunks: Chunk[];
+  if (reusable) {
+    coreChunks = previous!.chunkIds.map((id) => byId.get(id)!);
+  } else {
+    coreChunks = selectChunks(
+      scored,
+      plan.coreMax,
+      getTopKCapForBudget(plan.coreMax),
+    );
+  }
+  // A truncated fallback chunk keeps its ID, so IDs alone identify the core.
+  const core: CoreSelection = {
+    chunkIds: coreChunks.map((c) => c.id),
+    coreMax: plan.coreMax,
+  };
+  const coreIds = new Set(core.chunkIds);
+
+  // Supplement: the sections most relevant to *this* question that the core
+  // lacks. Only sections with some relevance qualify — structural position
+  // alone (being the abstract) is the core's job, not the supplement's.
+  const supplementCandidates = scored
+    .filter((c) => !coreIds.has(c.id) && c.relevance > 0)
+    .sort((a, b) => b.relevance - a.relevance)
+    .slice(0, MAX_SUPPLEMENT_CHUNKS);
+  const supplementChunks =
+    plan.supplementMax > 0
+      ? selectChunks(
+          supplementCandidates.map((c) => ({ ...c, score: c.relevance })),
+          plan.supplementMax,
+          MAX_SUPPLEMENT_CHUNKS,
+          false,
+        )
+      : [];
+
+  const chunkWhitelist = new Map<string, ChunkMeta>();
+  const coreText = renderChunks(coreChunks, chunkWhitelist);
+  const supplementText = renderChunks(supplementChunks, chunkWhitelist);
+
+  return finish("chunk-rag", coreText, supplementText, {
+    chunkWhitelist,
+    core,
+    stats: {
+      totalPages,
+      totalChunks: chunks.length,
+      selectedChunks: coreChunks.length + supplementChunks.length,
+      supplementChunks: supplementChunks.length,
+    },
+  });
+}
+
 /**
  * Builds the full RAG context for a user question about a Zotero item.
+ *
+ * Does the Zotero-dependent work — extraction, chunking, embeddings — and
+ * hands the result to {@link assembleContext}.
  *
  * @param item - The Zotero item being discussed (must have a PDF attachment).
  * @param question - The user's current question.
  * @param conversationHistory - Previous messages (excluding system + current question).
- * @param inputBudget - Usable input tokens for this provider/model, from
- *   `getInputBudget()` in `modules/llm/client.ts`. Callers must pass the
- *   resolved value; this used to be looked up from a hardcoded per-model table
- *   that returned 8K for any unrecognised model.
+ * @param plan - Allowances for this provider/model, from `getPromptPlan()` in
+ *   `modules/llm/client.ts`.
  * @returns Pipeline result with messages, chunk whitelist, and stats.
  */
 export async function buildRAGContext(
   item: Zotero.Item,
   question: string,
   conversationHistory: LLMMessage[],
-  inputBudget: number,
+  plan: PromptPlan,
 ): Promise<PipelineResult> {
   // --- Step 1-2: Extract + Chunk (with cache) ---
   let cached = itemCache.get(item.id);
@@ -192,7 +437,12 @@ export async function buildRAGContext(
     const extraction = await extractPDF(item);
     if (!extraction || extraction.pages.length === 0) {
       // No PDF content — return empty context.
-      const messages = buildMessages("", question, conversationHistory);
+      const historyMax =
+        plan.promptCapacity -
+        messageTokens({ content: getSystemPrompt("chunk-rag") }) -
+        messageTokens({ content: question });
+      const kept = fitHistory(conversationHistory, historyMax);
+      const messages = buildMessages("", question, kept);
       return {
         messages,
         chunkWhitelist: new Map(),
@@ -202,6 +452,9 @@ export async function buildRAGContext(
           totalChunks: 0,
           selectedChunks: 0,
           contextTokens: 0,
+          supplementChunks: 0,
+          historyDropped: conversationHistory.length - kept.length,
+          promptTokens: promptTokens(messages),
         },
       };
     }
@@ -218,48 +471,14 @@ export async function buildRAGContext(
 
   const { chunks, totalPages, pages } = cached;
 
-  // --- Step 2b: Whole-paper mode, when the full text fits the budget ---
-  //
-  // Preferred whenever it fits, for two reasons. It is cheaper: the document
-  // block is question-independent, so the prompt prefix is byte-identical
-  // across turns and prompt caching serves it at ~10% of input price from the
-  // second question onwards, instead of re-sending a freshly-selected chunk
-  // set at full price every turn. And it is better: the model sees the entire
-  // paper rather than a keyword-selected subset, so it can answer questions
-  // whose evidence the chunk scorer would have missed.
-  //
-  // The budget already encodes the provider's limits, including Haiku 5.5's
-  // 100K pricing band and the user's Ollama num_ctx, so no separate threshold
-  // is needed here — "fits the budget" is the whole condition.
-  const wholeContext = buildWholePaperContext(pages);
-  const wholeTokens = estimateTokens(wholeContext);
-
-  if (wholeContext && wholeTokens + PROMPT_OVERHEAD_TOKENS <= inputBudget) {
-    return {
-      messages: buildMessages(
-        wholeContext,
-        question,
-        conversationHistory,
-        "whole-paper",
-      ),
-      // Page citations are validated against pageCount, not this map.
-      chunkWhitelist: new Map(),
-      mode: "whole-paper",
-      pageCount: totalPages || pages.length,
-      stats: {
-        totalPages,
-        totalChunks: chunks.length,
-        selectedChunks: chunks.length,
-        contextTokens: wholeTokens,
-      },
-    };
-  }
-
-  // --- Step 3: Score chunks (with optional embeddings) ---
+  // --- Step 3: Embeddings, only when the document will not be sent whole ---
   let chunkEmbeddings: Map<string, number[]> | undefined;
   let questionEmbedding: number[] | undefined;
 
-  if (isModelReady()) {
+  const sentWhole =
+    estimateTokens(buildWholePaperContext(pages)) <= plan.wholePaperMax;
+
+  if (!sentWhole && isModelReady()) {
     try {
       // Load cached chunk embeddings from IndexedDB.
       const cachedRecords = await getChunkEmbeddingsByItemId(item.id);
@@ -302,55 +521,26 @@ export async function buildRAGContext(
     }
   }
 
-  const scored = scoreChunks(chunks, question, chunkEmbeddings, questionEmbedding);
+  // --- Step 4: Assemble ---
+  const result = assembleContext({
+    pages,
+    chunks,
+    totalPages,
+    question,
+    history: conversationHistory,
+    plan,
+    previousCore: coreCache.get(item.id),
+    chunkEmbeddings,
+    questionEmbedding,
+  });
 
-  // --- Step 4: Select within token budget + dynamic topK cap ---
-  const maxChunks = getTopKCapForBudget(inputBudget); // Caps chunk COUNT too.
-  const selected = selectChunks(scored, inputBudget, maxChunks);
-
-  // --- Step 5: Build context string + whitelist ---
-  // Re-sort selected chunks by page order for coherent reading.
-  selected.sort((a, b) => a.pageStart - b.pageStart || a.pageEnd - b.pageEnd);
-
-  const contextParts: string[] = [];
-  const chunkWhitelist = new Map<string, ChunkMeta>();
-
-  for (const chunk of selected) {
-    const pageRange =
-      chunk.pageStart === chunk.pageEnd
-        ? `p.${chunk.pageStart}`
-        : `pp.${chunk.pageStart}-${chunk.pageEnd}`;
-    contextParts.push(
-      `[c.${chunk.id} ${pageRange}]\n${chunk.text}\n[/c.${chunk.id}]`,
-    );
-    chunkWhitelist.set(chunk.id, {
-      pageStart: chunk.pageStart,
-      pageEnd: chunk.pageEnd,
-      excerpt: chunk.text.slice(0, 80).replace(/\n/g, " "),
-    });
+  if (result.core) {
+    coreCache.set(item.id, result.core);
+  } else {
+    coreCache.delete(item.id);
   }
 
-  const context = contextParts.join("\n\n");
-
-  // --- Step 6: Build messages ---
-  const messages = buildMessages(
-    context,
-    question,
-    conversationHistory,
-    "chunk-rag",
-  );
-
-  return {
-    messages,
-    chunkWhitelist,
-    mode: "chunk-rag",
-    stats: {
-      totalPages,
-      totalChunks: chunks.length,
-      selectedChunks: selected.length,
-      contextTokens: estimateTokens(context),
-    },
-  };
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +548,13 @@ export async function buildRAGContext(
 // ---------------------------------------------------------------------------
 
 interface ScoredChunk extends Chunk {
+  /** Overall rank: structural priority blended with relevance. */
   score: number;
+  /**
+   * How well the chunk matches the question, with no structural or position
+   * boost. Zero means nothing links it to the question.
+   */
+  relevance: number;
 }
 
 /**
@@ -417,9 +613,11 @@ function scoreChunks(
     if (index === chunks.length - 1) keywordScore += 50;
 
     // Keyword overlap.
+    let relevance = 0;
     for (const word of questionWords) {
-      if (lower.includes(word)) keywordScore += 10;
+      if (lower.includes(word)) relevance += 10;
     }
+    keywordScore += relevance;
 
     // D4 blend: use normalized scale when semantic mode is active.
     let finalScore: number;
@@ -430,6 +628,7 @@ function scoreChunks(
         ? cosineSimilarity(questionEmbedding!, chunkVec)
         : 0;
       const normSemantic = Math.max(0, rawSimilarity);
+      relevance += normSemantic * BLEND_SCALE;
       finalScore =
         (KEYWORD_WEIGHT * normKeyword + SEMANTIC_WEIGHT * normSemantic) *
         BLEND_SCALE;
@@ -437,7 +636,7 @@ function scoreChunks(
       finalScore = keywordScore;
     }
 
-    return { ...chunk, score: finalScore };
+    return { ...chunk, score: finalScore, relevance };
   });
 }
 
@@ -456,11 +655,15 @@ function scoreChunks(
  *
  * @param maxChunks - Optional maximum chunk count (dynamic topK from
  *   getTopKCapForBudget()).
+ * @param forceOne - When nothing fits, include the top chunk truncated to the
+ *   budget. Right for the core (some context beats none); wrong for the
+ *   supplement, which is optional.
  */
 function selectChunks(
-  scored: ScoredChunk[],
+  scored: Array<Chunk & { score: number }>,
   maxTokens: number,
   maxChunks?: number,
+  forceOne: boolean = true,
 ): Chunk[] {
   // Sort by score descending; apply topK cap before budget fill.
   const sorted = [...scored].sort((a, b) => b.score - a.score);
@@ -479,7 +682,7 @@ function selectChunks(
 
   // Guard: always include at least one chunk (truncated to budget), so the
   // user gets some context even when a single chunk exceeds the token cap.
-  if (selected.length === 0 && candidates.length > 0) {
+  if (forceOne && selected.length === 0 && candidates.length > 0) {
     const top = candidates[0]!;
     const maxChars = Math.max(budget - MARKER_OVERHEAD, 100);
     selected.push({

@@ -80,6 +80,22 @@ export function registerPrefsScripts(win: Window): void {
   );
   bindOllamaEnvironment(doc);
 
+  // --- Context size limits (0 = automatic) ---
+  bindNumber(
+    doc,
+    ID("whole-paper-max"),
+    prefs.getWholePaperMaxTokens(),
+    prefs.setWholePaperMaxTokens,
+    true,
+  );
+  bindNumber(
+    doc,
+    ID("retrieved-max"),
+    prefs.getRetrievedMaxTokens(),
+    prefs.setRetrievedMaxTokens,
+    true,
+  );
+
   // --- Gemini ---
   bindText(doc, ID("gemini-apikey"), prefs.getGeminiApiKey(), prefs.setGeminiApiKey);
   bindText(doc, ID("gemini-model"), prefs.getGeminiModel(), prefs.setGeminiModel);
@@ -186,6 +202,7 @@ function bindNumber(
   id: string,
   initialValue: number,
   setter: (value: number) => void,
+  allowZero: boolean = false,
 ): void {
   const el = doc.getElementById(id) as HTMLInputElement | null;
   if (!el) return;
@@ -194,7 +211,7 @@ function bindNumber(
   let lastSaved = initialValue;
   const save = () => {
     const parsed = parseInt(el.value, 10);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    if (!Number.isFinite(parsed) || parsed < 0 || (parsed === 0 && !allowZero)) {
       el.value = String(lastSaved); // Reject, restore last good value.
       return;
     }

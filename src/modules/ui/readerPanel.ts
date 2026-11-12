@@ -44,10 +44,11 @@ import type { ContextMode } from "../llm/client";
 import {
   createProvider,
   checkPrivacy,
-  getInputBudget,
+  getPromptPlan,
   resolveChatOptions,
 } from "../llm/client";
 import type { PipelineResult } from "../rag/pipeline";
+import { describeSelection, describeDroppedHistory } from "../rag/notes";
 import { consumeChatStream } from "../llm/stream";
 import { OllamaProvider } from "../llm/providers/ollama";
 import {
@@ -426,18 +427,19 @@ async function handleQuestion(
   // --- Build RAG context via pipeline ---
   const statusNote = appendStatusNote(messages, doc, "Extracting and analysing paper\u2026", scrollState.stick);
 
-  // Resolve the model and its real input budget. Both come from provider
-  // discovery, so an unpinned model and an unknown context window both work.
+  // Resolve the model and the prompt plan (how much document, and how much
+  // prompt in total, this model and these settings allow). Both come from
+  // provider discovery, so an unpinned model and an unknown window both work.
   let options;
-  let inputBudget;
+  let plan;
   try {
-    // Both read the same cached discovery result, so this is one round trip.
-    const [resolvedOptions, resolvedBudget] = await Promise.all([
+    // Both read the same cached discovery result.
+    const [resolvedOptions, resolvedPlan] = await Promise.all([
       resolveChatOptions(),
-      getInputBudget(),
+      getPromptPlan(),
     ]);
     options = resolvedOptions;
-    inputBudget = resolvedBudget.budget;
+    plan = resolvedPlan.plan;
   } catch (resolveErr: any) {
     statusNote.remove();
     appendBubble(
@@ -481,7 +483,7 @@ async function handleQuestion(
       ztoolkit.log("Failed to load conversation history:", dbErr?.message ?? dbErr);
     }
 
-    pipeline = await buildRAGContext(item, question, history, inputBudget);
+    pipeline = await buildRAGContext(item, question, history, plan);
 
     // Refresh sticky-scroll after the big async gap (PDF extraction + chunking
     // can take seconds). The user may have scrolled up during the wait.
@@ -496,7 +498,15 @@ async function handleQuestion(
         appendSystemNote(
           messages,
           doc,
-          `Paper: ${pipeline.stats.totalPages} pages, ${pipeline.stats.totalChunks} chunks. Showing ${pipeline.stats.selectedChunks} most relevant.`,
+          describeSelection(pipeline.stats),
+          scrollState.stick,
+        );
+      }
+      if (pipeline.stats.historyDropped > 0) {
+        appendSystemNote(
+          messages,
+          doc,
+          describeDroppedHistory(pipeline.stats.historyDropped),
           scrollState.stick,
         );
       }

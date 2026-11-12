@@ -299,6 +299,39 @@
     style="color: #888; font-size: 11px; margin-top: 8px;"
   />
 
+  <!-- ── Context size ───────────────────────────────────────────────── -->
+  <separator />
+  <label><html:h3 data-l10n-id="pref-context-label"></html:h3></label>
+  <hbox align="center" style="margin-top: 4px;">
+    <html:label
+      for="zotero-prefpane-__addonRef__-whole-paper-max"
+      data-l10n-id="pref-whole-paper-max-label"
+      style="min-width: 220px;"
+    ></html:label>
+    <html:input
+      type="number"
+      min="0"
+      step="1000"
+      id="zotero-prefpane-__addonRef__-whole-paper-max"
+      style="width: 120px;"
+    />
+  </hbox>
+  <hbox align="center" style="margin-top: 4px;">
+    <html:label
+      for="zotero-prefpane-__addonRef__-retrieved-max"
+      data-l10n-id="pref-retrieved-max-label"
+      style="min-width: 220px;"
+    ></html:label>
+    <html:input
+      type="number"
+      min="0"
+      step="1000"
+      id="zotero-prefpane-__addonRef__-retrieved-max"
+      style="width: 120px;"
+    />
+  </hbox>
+  <description style="color: #666; font-size: 11px;" data-l10n-id="pref-context-hint" />
+
   <!-- ── Semantic Search ─────────────────────────────────────────────── -->
   <separator />
   <label><html:h3 data-l10n-id="pref-semantic-label"></html:h3></label>

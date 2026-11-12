@@ -23,6 +23,11 @@ pref-custom-warning = ⚠ This endpoint will receive your paper content and API 
 
 pref-api-key-warning = API keys are stored as plaintext in your Zotero profile. Not suitable for shared machines.
 
+pref-context-label = Context size
+pref-whole-paper-max-label = Largest paper sent whole (tokens)
+pref-retrieved-max-label = Most text sent from a larger paper (tokens)
+pref-context-hint = 0 means automatic: about 60,000 and 24,000 tokens for cloud models, and 40% of the Ollama context size for local ones. A paper under the first limit is sent in full; a longer one is answered from its most relevant sections, up to the second limit. Lower values cost less and answer faster. A token is roughly four characters.
+
 pref-semantic-label = Semantic Search
 pref-semantic-toggle =
     .label = Enable semantic search (embedding-based)
