@@ -3,8 +3,14 @@
  *
  * Accurate tokenizers like tiktoken require large WASM files (~1MB) unsuitable
  * for a plugin bundle. This approximation (4 chars ≈ 1 token for English prose)
- * is sufficient for deciding when to truncate paper context before LLM calls.
- * The estimate errs slightly high (safe side: we truncate earlier than necessary).
+ * is a rough guide for deciding when to truncate paper context before LLM calls.
+ *
+ * **The estimate errs LOW, which is the unsafe side.** Academic text —
+ * equations, citations, hyphenated terms, non-English names — tokenizes into
+ * more tokens than plain prose, and current Claude models count roughly 30%
+ * more tokens than this for the same text. Anything that must fit a hard limit
+ * (a context window, a price band) needs its own margin on top of this number;
+ * do not treat it as an upper bound.
  *
  * **Token budgets no longer live here.** This module used to own a
  * `MODEL_TOKEN_CAPS` table keyed on exact model IDs, with an 8K fallback for

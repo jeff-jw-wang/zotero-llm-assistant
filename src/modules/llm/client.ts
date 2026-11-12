@@ -465,7 +465,10 @@ export function buildMessages(
   // the prefix is stable and cache reads should be ~90% of input from turn 2
   // onwards. In chunk-rag mode the selected chunks still depend on the
   // question, so the document message is marked cacheable but will usually
-  // miss; the system prompt still caches. See docs/MODERNIZATION_PLAN_2026.md §4.
+  // miss. Nothing else is cached in that case: the system prompt is far
+  // shorter than the minimum cacheable prefix (512 tokens on current Claude
+  // models), so its breakpoint is harmless but does nothing on its own.
+  // See docs/MODERNIZATION_PLAN_2026.md §3 (correction 9) and §5.2.
   const messages: LLMMessage[] = [
     { role: "system", content: getSystemPrompt(mode), cacheable: true },
   ];

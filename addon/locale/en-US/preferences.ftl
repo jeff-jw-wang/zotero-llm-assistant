@@ -26,7 +26,7 @@ pref-api-key-warning = API keys are stored as plaintext in your Zotero profile. 
 pref-semantic-label = Semantic Search
 pref-semantic-toggle =
     .label = Enable semantic search (embedding-based)
-pref-semantic-note = Downloads a ~25 MB model from HuggingFace on first use. Improves search quality by understanding meaning, not just keywords. Runs entirely on your machine.
+pref-semantic-note = Ranks results by similarity as well as by keywords. On first use this tries to load a small embedding model (~25 MB, from Hugging Face). If that model cannot load inside Zotero, a simpler built-in match on shared words and spelling is used instead, which does not understand meaning. Either way it runs entirely on your machine.
 
 pref-privacy-label = Privacy
 pref-cloud-sharing =
