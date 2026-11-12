@@ -78,7 +78,11 @@ export function createProvider(): ILLMProvider {
 
   switch (providerName) {
     case "ollama":
-      return new OllamaProvider(prefs.getOllamaEndpoint());
+      // The same numCtx that getInputBudget() sizes the prompt against.
+      return new OllamaProvider(
+        prefs.getOllamaEndpoint(),
+        prefs.getOllamaNumCtx(),
+      );
 
     case "gemini": {
       const apiKey = prefs.getGeminiApiKey();
@@ -142,7 +146,10 @@ export function createProvider(): ILLMProvider {
  */
 export async function autoDetectProvider(): Promise<ILLMProvider> {
   // Try Ollama first (local, no API key needed).
-  const ollama = new OllamaProvider(prefs.getOllamaEndpoint());
+  const ollama = new OllamaProvider(
+    prefs.getOllamaEndpoint(),
+    prefs.getOllamaNumCtx(),
+  );
   if (await ollama.isAvailable()) {
     prefs.setActiveProvider("ollama");
     return ollama;

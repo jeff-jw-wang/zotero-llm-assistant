@@ -23,7 +23,11 @@ import type {
 import { httpPost, httpGet } from "../../../utils/http";
 
 const DEFAULT_ENDPOINT = "http://localhost:11434";
-const DEFAULT_NUM_CTX = 16_384;
+/**
+ * Context size sent when the caller supplies none. Matches the default of the
+ * `llm.ollama.numCtx` preference.
+ */
+export const DEFAULT_NUM_CTX = 16_384;
 
 /** Connection timeout (ms) — fires if no response data arrives within this window. */
 const CONNECTION_TIMEOUT_MS = 15_000;
@@ -40,9 +44,44 @@ export class OllamaProvider implements ILLMProvider {
   readonly isCloud = false;
 
   private endpoint: string;
+  private numCtx: number;
 
-  constructor(endpoint?: string) {
+  /**
+   * @param endpoint - Ollama base URL. Defaults to the local server.
+   * @param numCtx - Context size in tokens to request (`options.num_ctx`).
+   *   Must be the same number the prompt was budgeted against: Ollama
+   *   silently truncates a prompt longer than the context it allocated, and
+   *   its own default is only 4K on most machines, so a value is always sent.
+   */
+  constructor(endpoint?: string, numCtx?: number) {
     this.endpoint = (endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+    this.numCtx =
+      typeof numCtx === "number" && Number.isFinite(numCtx) && numCtx > 0
+        ? Math.floor(numCtx)
+        : DEFAULT_NUM_CTX;
+  }
+
+  /**
+   * Builds the `/api/chat` request body.
+   *
+   * Public so tests can assert on exactly what is sent, in particular that
+   * `options.num_ctx` carries the configured context size.
+   */
+  buildRequestBody(
+    messages: LLMMessage[],
+    options: ChatOptions,
+    stream: boolean,
+  ): Record<string, unknown> {
+    return {
+      model: options.model,
+      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      stream,
+      options: {
+        num_ctx: this.numCtx,
+        ...(options.temperature != null && { temperature: options.temperature }),
+        ...(options.maxTokens != null && { num_predict: options.maxTokens }),
+      },
+    };
   }
 
   /**
@@ -55,16 +94,7 @@ export class OllamaProvider implements ILLMProvider {
     try {
       response = await httpPost(
         `${this.endpoint}/api/chat`,
-      JSON.stringify({
-        model: options.model,
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
-        stream: false,
-        options: {
-          num_ctx: DEFAULT_NUM_CTX,
-          ...(options.temperature != null && { temperature: options.temperature }),
-          ...(options.maxTokens != null && { num_predict: options.maxTokens }),
-        },
-      }),
+        JSON.stringify(this.buildRequestBody(messages, options, false)),
         { "Content-Type": "application/json" },
         CONNECTION_TIMEOUT_MS,
       );
@@ -104,16 +134,7 @@ export class OllamaProvider implements ILLMProvider {
     messages: LLMMessage[],
     options: ChatOptions,
   ): AsyncGenerator<StreamChunk, void, unknown> {
-    const body = JSON.stringify({
-      model: options.model,
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
-      stream: true,
-      options: {
-        num_ctx: DEFAULT_NUM_CTX,
-        ...(options.temperature != null && { temperature: options.temperature }),
-        ...(options.maxTokens != null && { num_predict: options.maxTokens }),
-      },
-    });
+    const body = JSON.stringify(this.buildRequestBody(messages, options, true));
 
     // Use XHR-based streaming in Zotero (avoids fetch() reliability issues).
     // Fall back to fetch() in test environments where XMLHttpRequest is unavailable.
