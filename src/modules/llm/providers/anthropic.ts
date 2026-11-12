@@ -10,7 +10,8 @@
  * - System messages are extracted to a top-level `system` field
  * - `max_tokens` is required (not optional)
  * - Streaming uses SSE with typed events (content_block_delta / message_stop)
- * - Response body uses `content[0].text` (not `choices[0].message.content`)
+ * - Response body is a list of typed content blocks; the answer is the
+ *   `text` blocks, which may follow a `thinking` block
  *
  * @module modules/llm/providers/anthropic
  * @see https://docs.anthropic.com/en/api/messages
@@ -54,6 +55,27 @@ const CONNECTION_TIMEOUT_MS = 30_000;
 
 /** Idle-read timeout (ms) — abort if no streaming data arrives for this long. */
 const IDLE_READ_TIMEOUT_MS = 60_000;
+
+/**
+ * Joins the text of a Messages API response, skipping every non-text block.
+ *
+ * `content` is a list of typed blocks, and the answer is not necessarily the
+ * first one: a model with thinking enabled (the default on Haiku 5.5) returns
+ * a `thinking` block first, which has no `text` field. Reading `content[0]`
+ * therefore returned an empty answer. Text can also be split across several
+ * `text` blocks.
+ *
+ * @param data - Parsed response body.
+ * @returns The concatenated text, or `""` when there is none.
+ */
+export function extractAnthropicText(data: any): string {
+  const blocks: unknown = data?.content;
+  if (!Array.isArray(blocks)) return "";
+  return blocks
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string)
+    .join("");
+}
 
 export class AnthropicProvider implements ILLMProvider {
   readonly name = "Anthropic";
@@ -159,7 +181,7 @@ export class AnthropicProvider implements ILLMProvider {
     // Non-streaming has no chunk to carry usage on, so stash it for the
     // caller to read via lastChatUsage(). Used by the non-stream fallback path.
     this.lastUsage = this.parseUsage(data.usage);
-    return data.content?.[0]?.text ?? "";
+    return extractAnthropicText(data);
   }
 
   async *chatStream(

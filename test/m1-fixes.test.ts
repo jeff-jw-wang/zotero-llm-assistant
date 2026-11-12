@@ -58,6 +58,9 @@ const PREFIX = "extensions.zotero.zotero-llm-assistant";
 const { OllamaProvider, DEFAULT_NUM_CTX } = await import(
   "../src/modules/llm/providers/ollama"
 );
+const { AnthropicProvider, extractAnthropicText } = await import(
+  "../src/modules/llm/providers/anthropic"
+);
 const { createProvider } = await import("../src/modules/llm/client");
 
 // ---------------------------------------------------------------------------
@@ -230,6 +233,67 @@ await test("every data-l10n-id in the settings pane is defined", () => {
   for (const m of XHTML.matchAll(/data-l10n-id="([^"]+)"/g)) {
     assert.ok(ftl.has(m[1]!), `"${m[1]}" is not defined in preferences.ftl`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// D4 — Anthropic non-streaming text extraction
+// ---------------------------------------------------------------------------
+
+console.log("\n=== D4: Anthropic answers survive a leading thinking block ===\n");
+
+/** A response as a thinking-enabled model returns it: thinking first. */
+const THINKING_FIRST = {
+  id: "msg_01",
+  type: "message",
+  role: "assistant",
+  content: [
+    { type: "thinking", thinking: "", signature: "sig" },
+    { type: "text", text: "The main finding is X [p.3]." },
+  ],
+  stop_reason: "end_turn",
+  usage: { input_tokens: 1200, output_tokens: 40, cache_read_input_tokens: 1000 },
+};
+
+await test("text is found when the first block is a thinking block", () => {
+  assert.equal(extractAnthropicText(THINKING_FIRST), "The main finding is X [p.3].");
+});
+
+await test("several text blocks are joined in order; other blocks are skipped", () => {
+  const data = {
+    content: [
+      { type: "thinking", thinking: "..." },
+      { type: "text", text: "First. " },
+      { type: "redacted_thinking", data: "abc" },
+      { type: "tool_use", id: "t1", name: "x", input: {} },
+      { type: "text", text: "Second." },
+    ],
+  };
+  assert.equal(extractAnthropicText(data), "First. Second.");
+});
+
+await test("a plain single-text response still works", () => {
+  assert.equal(
+    extractAnthropicText({ content: [{ type: "text", text: "Hello" }] }),
+    "Hello",
+  );
+});
+
+await test("no text blocks, or a malformed body, yields an empty string", () => {
+  assert.equal(extractAnthropicText({ content: [{ type: "thinking", thinking: "x" }] }), "");
+  assert.equal(extractAnthropicText({ content: [] }), "");
+  assert.equal(extractAnthropicText({}), "");
+  assert.equal(extractAnthropicText(undefined), "");
+  assert.equal(extractAnthropicText({ content: "not a list" }), "");
+});
+
+await test("chat() returns the answer and usage from a thinking-first response", async () => {
+  sent.length = 0;
+  nextResponse = THINKING_FIRST;
+  const provider = new AnthropicProvider("test-key");
+  const answer = await provider.chat(MESSAGES, { model: "claude-haiku-5-5" });
+  assert.equal(answer, "The main finding is X [p.3].");
+  assert.equal(provider.lastChatUsage()?.cacheReadTokens, 1000);
+  assert.equal(sent[0]!.body.model, "claude-haiku-5-5");
 });
 
 // ---------------------------------------------------------------------------
