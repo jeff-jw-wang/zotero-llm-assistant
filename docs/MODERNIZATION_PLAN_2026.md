@@ -909,7 +909,14 @@ question is the wrong default at this size.
 ### Still open
 
 1. Is the owner's Mac Apple Silicon, and how much memory does it have?
-2. Which Zotero version?
+2. ~~Which Zotero version?~~ **Zotero 10.0.9** (owner, 12 November 2026).
+   Everything in this repository was written against Zotero 7-era APIs
+   (`zotero-types`, the toolkit, `Zotero.Server`, `nsIServerSocket`, the Run
+   JavaScript window). None of it has been checked against Zotero 10, and
+   zotero.org is not reachable from the cloud session. The manifest accepts any
+   version from 7 up (`strict_max_version: "*"`), so the add-on will install;
+   whether it starts is the first thing §7 step 1 shows. If it fails, the
+   debug output from Help → Debug Output Logging is what to send back.
 3. Which other providers matter for testing?
 4. Is sending titles and authors to a cloud provider acceptable, with private
    items excluded?
