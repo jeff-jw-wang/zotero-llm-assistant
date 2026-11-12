@@ -12,15 +12,21 @@ review got wrong, and what to do next, in order.
 
 **State of the code.** Branch `claude/confident-bardeen-j2v7eq` is **not
 merged**. It contains three phases of changes (v0.2.0 → v0.4.0) on top of the
-released v0.1.1b, plus milestone M1 (v0.4.1), which fixes the four defects
-that broke default behaviour (D1–D4) and two smaller ones (D8, D17). See §4
-for what each fix did.
+released v0.1.1b, plus:
 
-**Do not merge or release it yet.** M1 is code and unit tests only. The
-runtime check in Zotero (§7) has not been run, and it is the gate.
+- **M1 (v0.4.1), complete:** fixes for the four defects that broke default
+  behaviour (D1–D4) and two smaller ones (D8, D17).
+- **M2, the parts that need no Zotero (v0.5.0-beta.1):** D5, D6, D7, D10, D11
+  and the context policy of §5.2. Still open in M2: D9 (token and cache counts
+  for OpenAI, Gemini and Ollama), which needs live responses to verify.
 
-**What has been verified:** TypeScript compiles, 251 unit tests pass, the XPI
-builds as v0.4.1. **What has not:** the plugin has never been run inside
+See §4 for what each fix did.
+
+**Do not merge or release it yet.** All of this is code and unit tests only.
+The runtime check in Zotero (§7) has not been run, and it is the gate.
+
+**What has been verified:** TypeScript compiles, 304 unit tests pass, the XPI
+builds as v0.5.0-beta.1. **What has not:** the plugin has never been run inside
 Zotero since these changes, and no request has been sent to any provider. Every statement
 about runtime behaviour below is from reading code and documentation. Facts
 about Ollama, Hugging Face and OpenAI were checked against their own sites on
@@ -29,10 +35,12 @@ about Ollama, Hugging Face and OpenAI were checked against their own sites on
 **Next steps, in order:**
 
 1. ~~Fix the P0 defects (§4.1).~~ Done in M1, 12 November 2026.
-2. Run the 15-minute runtime checklist in Zotero (§7) on the v0.4.1 build.
-   Only the repository owner can do this — a cloud session has no Zotero.
-   **This is the current step.** Record results in §7.1.
-3. Fix the P1 defects and adopt the revised context policy (§5.2).
+2. Run the runtime checklist in Zotero (§7) on the v0.5.0-beta.1 build, and
+   the M4 callback experiment (§7.2), in the same sitting. Only the repository
+   owner can do this — a cloud session has no Zotero.
+   **This is the current step.** Record results in §7.1 and §7.2.
+3. ~~Fix the P1 defects and adopt the revised context policy (§5.2).~~ Done
+   except D9 and D12 (D12 belongs to M3).
 4. Add sign-in with a ChatGPT plan (§5.4, milestone M4). The owner has ChatGPT
    Plus, and this is now officially supported for apps like this one.
 5. Rebuild library search on a real semantic signal (§5.3, milestone M3). The
@@ -87,6 +95,8 @@ Zotero with Tools → Add-ons → gear → Install Add-on From File.
 | `98b21a0` | 0.4.0 | Library search by rank fusion of keyword and embedding rankings, windowed embedding of long text, 1500-character abstracts, "from general knowledge" answer section. |
 
 | M1 commits | 0.4.1 | Fixes for D1, D2, D3, D4, D8, D17, one commit each (`fix(D1)` … `fix(D17)`). New: `pickModel()` and Ollama capability discovery in `models.ts`, `src/modules/llm/stream.ts`, `test/m1-fixes.test.ts`. |
+
+| M2 commits | 0.5.0-beta.1 | Two `feat(M2)` commits. New: `src/modules/llm/budget.ts` (prompt planning), a pure `assembleContext()` in `pipeline.ts` (stable core plus supplement), `src/modules/rag/notes.ts`, two context-limit settings, `test/budget.test.ts`. |
 
 New tests: `test/models.test.ts`, `test/caching.test.ts`,
 `test/library-retrieval.test.ts`. They cover pure functions only. Nothing tests
@@ -312,7 +322,17 @@ in `client.ts` also built a provider used for chat; both now pass the setting.
 
 ### 4.2 P1 — wrong behaviour or unbounded cost
 
-**D5. Local prompts can exceed the Ollama context.**
+**D5. Local prompts can exceed the Ollama context. — FIXED in M2
+(unit-tested; the acceptance test in §6 M2 passes).**
+*How it was fixed differs from the fix proposed below, on purpose.* Shrinking
+the document by the measured history would change the document block on every
+turn and so defeat the stable prefix that §5.2 asks for. Instead
+`planPrompt()` sizes the document from the model and the settings only, always
+keeping room for the system prompt, the question and some conversation; and
+`fitHistory()` drops the oldest history until the whole prompt fits. The
+margin is 15% (35% for Claude, D7). The reader shows "Left out N earlier
+messages…" when that happens.
+*As originally written:*
 `resolveInputBudget` (`models.ts:203`) subtracts only an output reserve, and
 chunk mode fills the entire budget (`src/modules/rag/pipeline.ts:309`) without
 subtracting the system prompt, up to six history messages
@@ -322,7 +342,18 @@ The estimate itself (4 characters per token) runs low on academic text.
 *Fix:* document budget = window − output reserve − measured history − question
 − a margin of at least 15%.
 
-**D6. Neither context mode has a cost ceiling.**
+**D6. Neither context mode has a cost ceiling. — FIXED in M2 (unit-tested).**
+Settings → Context size has two fields, both in estimated tokens with 0
+meaning automatic (preferences `context.wholePaperMaxTokens` and
+`context.retrievedMaxTokens`). Automatic is 60,000 / 24,000 for cloud models
+and 40% of the context size for Ollama.
+**Consequence to check at runtime:** with the default 16,384 Ollama context, a
+paper longer than about 6,500 estimated tokens (roughly 26,000 characters,
+six to eight pages) is answered from selected sections rather than sent whole.
+That is most papers. It follows from the 40% rule in §5.2, which was chosen
+for a machine with no usable GPU; if answers suffer, raise the context size or
+the first field.
+*As originally written:*
 Whole-paper mode accepts anything up to the window (`pipeline.ts:237`). Chunk
 mode fills the whole budget — on a 1M-token model, up to about 990K tokens per
 question, uncached, where v0.1.1b capped at 32K. On Haiku this is hidden by the
@@ -332,7 +363,13 @@ question about an 80K-token thesis costs about $0.32 on Sonnet 5.5 with the
 *Fix:* two explicit settings independent of the window — a maximum size for
 whole-paper mode and a maximum for retrieved chunks (§5.2).
 
-**D7. The token estimate can push Haiku requests over its price band.**
+**D7. The token estimate can push Haiku requests over its price band. —
+FIXED in M2 (unit-tested).** `tokenizerFactor()` is 1.35 for every Claude
+model and 1.15 elsewhere; a full Haiku 5.5 prompt is now at most ~68K
+estimated tokens, which is ~92K real. The OpenAI long-context price threshold
+is still unchecked; the 60K default keeps requests well below any plausible
+one.
+*As originally written:*
 Haiku 5.5 is billed 5× more per token above 100K prompt tokens. The band cap
 (`models.ts:96`) is applied to the 4-characters-per-token estimate, but Haiku's
 tokenizer counts about 30% more, so an estimated 88K can be a real 115K. This
@@ -363,11 +400,19 @@ its API documentation. OpenAI's documentation confirms `cached_tokens`, under
 spelling this plugin would need and the Gemini field are from memory — verify
 against a live response.
 
-**D10. `max_tokens` is not clamped to the model's limit.** The defaults (16K
+**D10. — FIXED in M2 (unit-tested).** `resolveChatOptions()` carries the
+output limit from discovery and the Anthropic provider clamps to it.
+**`max_tokens` is not clamped to the model's limit.** The defaults (16K
 non-streaming, 64K streaming, `anthropic.ts:40`) are rejected by older models a
 user may pin. Discovery already returns `maxOutputTokens`; nothing uses it.
 
-**D11. Refusals and empty completions render as a blank bubble.** Current
+**D11. — FIXED in M2 for Anthropic and for empty answers from any provider
+(unit-tested).** `describeStop()` in `src/modules/llm/stream.ts`. An empty
+answer is also no longer saved to the conversation, because it would be
+replayed as an empty assistant turn, which providers reject. Not done: mapping
+OpenAI's and Gemini's own refusal/safety stop reasons, and the library panel,
+which has its own stream loop.
+**Refusals and empty completions render as a blank bubble.** Current
 Claude models can stop with `stop_reason: "refusal"`. Show a message instead.
 
 **D12. Vectors from different embedding backends can mix.** Stored vectors
@@ -463,6 +508,12 @@ The prefix stays byte-identical, so cloud caching works on large documents and
 Ollama reuses its state on follow-ups, while each question still gets targeted
 evidence. Citations validate against core and supplement together.
 
+**Status (M2):** implemented and unit-tested, not run. The core is held in
+memory per item for the session; it is chosen afresh when the conversation is
+empty, when the limits change, or when the PDF is re-indexed. `keep_alive` is
+`30m`; `think: false` is sent only to models whose `/api/show` capabilities
+include `thinking`. All three request settings below are now sent.
+
 **Ollama request settings to add.** All three are in Ollama's API
 documentation: the context size, `options.num_ctx`, from the setting (D2);
 `keep_alive`, long enough that the model is not unloaded between questions
@@ -551,7 +602,11 @@ How it works, per the documentation:
   `client_id=dynamic_agent_client` the first time. The callback returns a
   client ID issued to this installation, which is reused afterwards.
 - The callback must be an HTTP listener on `127.0.0.1` — not `localhost`. Only
-  the port may differ between sign-ins.
+  the port may differ between sign-ins. Re-read on 12 November 2026: the
+  *path* is ours to choose but is fixed from the first registration onward
+  ("`/callback` does not match `/auth/callback`"), so decide it once. The
+  first sign-in must also send `agent_name_hint`, a persistent
+  `ext_agent_host_id`, and `resource=https://api.openai.com/v1`.
 - Scopes: `openid profile email offline_access resource.invoke
   chatgpt.tokens.use.direct`.
 - Tokens come from `https://auth.openai.com/api/accounts/oauth/token`. Access
@@ -724,10 +779,49 @@ and search for `Zotero LLM Assistant`.
   will probably ask you to choose (see D1). **Please copy the full Detect
   output for Gemini into §7.1** — it is the model list this plan lacks.
 
+**Added for the M2 changes (same build):**
+
+9. **Context size settings.** Settings → LLM Assistant has a "Context size"
+   section with two number fields showing 0. Type a value, click elsewhere,
+   reopen settings: it persists. Set it back to 0.
+10. **A long document.** Ask about a PDF of 50 pages or more. A note should
+    read "Paper: N pages, M sections. Sent K of them". Ask two follow-ups on
+    different topics: the note should mention sections "picked for this
+    question", and on Anthropic the footer's cache *read* count should be above
+    zero from the second question.
+11. **Ollama stays loaded.** After a question, `ollama ps` should show the
+    model with roughly 30 minutes remaining, not 5.
+12. **Thinking pause.** On Anthropic, the "Connecting…" note should stay
+    visible until the first words of the answer appear.
+
 ### 7.1 Results
 
 Not yet run. Record here, per step: what happened, the Zotero version, the
 operating system and machine, and any lines from the debug output.
+
+### 7.2 M4 experiment 1 — can Zotero receive the sign-in callback?
+
+This decides whether M4 goes ahead, so it comes before any M4 code. It
+contacts nothing outside the computer and involves no ChatGPT account.
+
+1. In Zotero: Tools → Developer → Run JavaScript. Paste the contents of
+   `docs/experiments/m4-callback-start.js` and press Run. It prints two links.
+2. Open both links in your normal web browser. Each should show a page saying
+   "Route A/B: Zotero received this request."
+3. Back in Run JavaScript, paste `docs/experiments/m4-callback-report.js`,
+   press Run, and copy the output here.
+
+Route A is an endpoint on Zotero's own local server (port 23119 by default);
+Route B is a listener of our own on port 1455. Either one working is enough;
+Route B is preferable because it does not depend on Zotero's server being
+enabled and can close as soon as sign-in finishes. If neither works, M4 stops
+here.
+
+The scripts were dry-run against mocked Zotero objects only. Whether
+`Zotero.Server` accepts a request from a browser, and whether a plugin may
+open a server socket, are exactly what is unknown.
+
+**Result:** not yet run.
 
 ---
 
