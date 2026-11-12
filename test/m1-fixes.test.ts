@@ -62,6 +62,9 @@ const { AnthropicProvider, extractAnthropicText } = await import(
   "../src/modules/llm/providers/anthropic"
 );
 const { createProvider } = await import("../src/modules/llm/client");
+const { consumeChatStream, hasAnswerText } = await import(
+  "../src/modules/llm/stream"
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -294,6 +297,93 @@ await test("chat() returns the answer and usage from a thinking-first response",
   assert.equal(answer, "The main finding is X [p.3].");
   assert.equal(provider.lastChatUsage()?.cacheReadTokens, 1000);
   assert.equal(sent[0]!.body.model, "claude-haiku-5-5");
+});
+
+// ---------------------------------------------------------------------------
+// D8 — the progress note is cleared by text, not by the first event
+// ---------------------------------------------------------------------------
+
+console.log("\n=== D8: only answer text clears the progress note ===\n");
+
+async function* streamOf(chunks: any[]) {
+  for (const c of chunks) yield c;
+}
+
+await test("hasAnswerText is false for usage-only and empty chunks", () => {
+  assert.equal(hasAnswerText({ text: "", done: false, usage: { inputTokens: 5 } }), false);
+  assert.equal(hasAnswerText({ text: "", done: true }), false);
+  assert.equal(hasAnswerText({ text: "a", done: false }), true);
+});
+
+await test("a leading usage report does not count as the first text", async () => {
+  // What Anthropic sends with a thinking model: usage first, then a pause,
+  // then text.
+  const events: string[] = [];
+  const result = await consumeChatStream(
+    streamOf([
+      { text: "", done: false, usage: { inputTokens: 1200, cacheReadTokens: 1000 } },
+      { text: "", done: false },
+      { text: "Hel", done: false },
+      { text: "lo", done: false },
+      { text: "", done: false, usage: { outputTokens: 40 } },
+      { text: "", done: true },
+    ]),
+    {
+      onFirstText: () => events.push("first"),
+      onText: (t: string) => events.push(`text:${t}`),
+    },
+  );
+  assert.deepEqual(events, ["first", "text:Hel", "text:Hello"]);
+  assert.equal(result.text, "Hello");
+  assert.equal(result.sawText, true);
+});
+
+await test("usage reports are merged, not replaced", async () => {
+  const result = await consumeChatStream(
+    streamOf([
+      { text: "", done: false, usage: { inputTokens: 1200, cacheReadTokens: 1000 } },
+      { text: "ok", done: false },
+      { text: "", done: true, usage: { outputTokens: 40 } },
+    ]),
+  );
+  assert.deepEqual(result.usage, {
+    inputTokens: 1200,
+    cacheReadTokens: 1000,
+    outputTokens: 40,
+  });
+});
+
+await test("a stream with no text never fires onFirstText", async () => {
+  let fired = 0;
+  const result = await consumeChatStream(
+    streamOf([
+      { text: "", done: false, usage: { inputTokens: 10 } },
+      { text: "", done: true },
+    ]),
+    { onFirstText: () => fired++ },
+  );
+  assert.equal(fired, 0);
+  assert.equal(result.sawText, false);
+  assert.equal(result.text, "");
+});
+
+await test("consumption stops at the done chunk", async () => {
+  const result = await consumeChatStream(
+    streamOf([
+      { text: "a", done: false },
+      { text: "b", done: true },
+      { text: "never", done: false },
+    ]),
+  );
+  assert.equal(result.text, "ab");
+});
+
+await test("a stream error propagates so the non-streaming fallback can run", async () => {
+  async function* failing() {
+    yield { text: "par", done: false };
+    throw new Error("network error");
+  }
+  await assert.rejects(() => consumeChatStream(failing()), /network error/);
 });
 
 // ---------------------------------------------------------------------------

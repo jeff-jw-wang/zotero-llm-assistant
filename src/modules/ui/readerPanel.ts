@@ -47,6 +47,8 @@ import {
   getInputBudget,
   resolveChatOptions,
 } from "../llm/client";
+import type { PipelineResult } from "../rag/pipeline";
+import { consumeChatStream } from "../llm/stream";
 import { OllamaProvider } from "../llm/providers/ollama";
 import {
   appendMessage as dbAppendMessage,
@@ -448,7 +450,7 @@ async function handleQuestion(
   }
 
   let fullResponse = "";
-  let pipeline;
+  let pipeline: PipelineResult;
   let usedStream = true; // Flipped to false if streaming fails and we fall back to chat().
   /** Token accounting reported by the provider, if any. */
   let usage: TokenUsage | undefined;
@@ -519,33 +521,35 @@ async function handleQuestion(
     messages.appendChild(assistantBubble);
     scrollToBottom(messages, scrollState.stick);
 
+    // True until answer text has been shown; the status note stays up for as
+    // long as it is. A usage report or a thinking pause does not clear it.
     let firstChunk = true;
 
     try {
-      for await (const chunk of provider.chatStream(pipeline.messages, options)) {
-        if (firstChunk) {
-          removeStatusNote(statusNote);
-          firstChunk = false;
-        }
-        // Usage arrives incrementally (input/cache first, output last), so
-        // merge rather than replace.
-        if (chunk.usage) {
-          usage = { ...(usage ?? {}), ...chunk.usage };
-        }
-        fullResponse += chunk.text;
-        // Re-check scroll position BEFORE DOM mutation (each chunk may change height).
-        scrollState.stick = isNearBottom(messages);
-        renderResponseWithCitations(
-          assistantBubble,
-          doc,
-          fullResponse,
-          pipeline.chunkWhitelist,
-          item,
-          pipeline.pageCount,
-        );
-        scrollToBottom(messages, scrollState.stick);
-        if (chunk.done) break;
-      }
+      const streamed = await consumeChatStream(
+        provider.chatStream(pipeline.messages, options),
+        {
+          onFirstText: () => {
+            removeStatusNote(statusNote);
+            firstChunk = false;
+          },
+          onText: (text) => {
+            fullResponse = text;
+            // Re-check scroll position BEFORE DOM mutation (each chunk may change height).
+            scrollState.stick = isNearBottom(messages);
+            renderResponseWithCitations(
+              assistantBubble,
+              doc,
+              fullResponse,
+              pipeline.chunkWhitelist,
+              item,
+              pipeline.pageCount,
+            );
+            scrollToBottom(messages, scrollState.stick);
+          },
+        },
+      );
+      if (streamed.usage) usage = { ...(usage ?? {}), ...streamed.usage };
     } catch (streamErr: any) {
       if (!shouldRetryNonStream(streamErr)) {
         throw streamErr;
