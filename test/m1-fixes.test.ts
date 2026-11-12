@@ -1,6 +1,7 @@
 /**
- * Tests for the M1 defect fixes that are not about model selection
- * (those live in models.test.ts).
+ * Tests for provider request and response handling: the M1 defect fixes that
+ * are not about model selection (those live in models.test.ts), and the M2
+ * fixes D10 and D11 plus the Ollama request settings from §5.2.
  *
  * Runs standalone: `npx tsx test/m1-fixes.test.ts`
  * No test framework dependency — uses Node's built-in assert.
@@ -10,6 +11,9 @@
  *   D4 — Anthropic non-streaming answers survive a leading thinking block.
  *   D8 — the progress note is cleared by answer text, not by a usage report.
  *   D3 — button labels in the settings locale file use the attribute form.
+ *   D10 — the output-token request is clamped to the model's limit.
+ *   D11 — refusals and empty answers are explained, not shown blank.
+ *   §5.2 — Ollama requests carry keep_alive, and think:false where it applies.
  *
  * No network: providers are driven through a stubbed `Zotero.HTTP.request`
  * and a stubbed `fetch`, and the request bodies they send are captured.
@@ -62,9 +66,12 @@ const { AnthropicProvider, extractAnthropicText } = await import(
   "../src/modules/llm/providers/anthropic"
 );
 const { createProvider } = await import("../src/modules/llm/client");
-const { consumeChatStream, hasAnswerText } = await import(
+const { consumeChatStream, hasAnswerText, describeStop } = await import(
   "../src/modules/llm/stream"
 );
+const { chatOptionsFromModelInfo } = await import("../src/modules/llm/client");
+const { clampMaxTokens } = await import("../src/modules/llm/types");
+const { KEEP_ALIVE } = await import("../src/modules/llm/providers/ollama");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -384,6 +391,206 @@ await test("a stream error propagates so the non-streaming fallback can run", as
     throw new Error("network error");
   }
   await assert.rejects(() => consumeChatStream(failing()), /network error/);
+});
+
+// ---------------------------------------------------------------------------
+// D10 — max_tokens clamped to the model's limit
+// ---------------------------------------------------------------------------
+
+console.log("\n=== D10: output request is clamped to the model's limit ===\n");
+
+/** Reaches the provider's private request builder for shape assertions. */
+function anthropicRequest(options: any, defaultMax?: number): any {
+  const provider: any = new AnthropicProvider("test-key");
+  return defaultMax === undefined
+    ? provider.buildRequest(MESSAGES, options)
+    : provider.buildRequest(MESSAGES, options, defaultMax);
+}
+
+await test("clampMaxTokens lowers a request above the limit and leaves others alone", () => {
+  assert.equal(clampMaxTokens(64_000, 8_192), 8_192);
+  assert.equal(clampMaxTokens(16_000, 64_000), 16_000);
+  assert.equal(clampMaxTokens(16_000, undefined), 16_000);
+  assert.equal(clampMaxTokens(16_000, 0), 16_000);
+  assert.equal(clampMaxTokens(16_000, NaN), 16_000);
+});
+
+await test("an older model with a 4,096 limit is not asked for the 64K streaming default", () => {
+  const body = anthropicRequest(
+    { model: "claude-3-haiku-20240307", modelMaxOutputTokens: 4_096 },
+    64_000,
+  );
+  assert.equal(body.max_tokens, 4_096);
+});
+
+await test("a current model keeps the defaults", () => {
+  const opts = { model: "claude-haiku-5-5", modelMaxOutputTokens: 128_000 };
+  assert.equal(anthropicRequest(opts).max_tokens, 16_000);
+  assert.equal(anthropicRequest(opts, 64_000).max_tokens, 64_000);
+});
+
+await test("an unknown limit leaves the default untouched", () => {
+  assert.equal(anthropicRequest({ model: "claude-haiku-5-5" }, 64_000).max_tokens, 64_000);
+});
+
+await test("an explicit maxTokens is clamped too", () => {
+  const body = anthropicRequest({
+    model: "m",
+    maxTokens: 50_000,
+    modelMaxOutputTokens: 8_192,
+  });
+  assert.equal(body.max_tokens, 8_192);
+});
+
+await test("discovery's output limit is carried into the chat options", () => {
+  assert.deepEqual(
+    chatOptionsFromModelInfo("anthropic", { maxOutputTokens: 8_192 }),
+    { modelMaxOutputTokens: 8_192 },
+  );
+  assert.deepEqual(chatOptionsFromModelInfo("anthropic", undefined), {});
+  assert.deepEqual(chatOptionsFromModelInfo("openai", {}), {});
+});
+
+// ---------------------------------------------------------------------------
+// D11 — refusals and empty completions
+// ---------------------------------------------------------------------------
+
+console.log("\n=== D11: refusals and empty answers are explained ===\n");
+
+await test("a normal answer needs no explanation", () => {
+  assert.equal(describeStop("The finding is X.", "end_turn"), undefined);
+  assert.equal(describeStop("The finding is X.", undefined), undefined);
+  assert.equal(describeStop("The finding is X.", "stop_sequence"), undefined);
+});
+
+await test("a refusal with no text says the model declined", () => {
+  assert.match(describeStop("", "refusal")!, /declined to answer/);
+});
+
+await test("a refusal after partial text says the answer is incomplete", () => {
+  assert.match(describeStop("The paper says", "refusal")!, /incomplete/);
+});
+
+await test("running out of output before any text points at the effort setting", () => {
+  assert.match(describeStop("", "max_tokens")!, /Effort/);
+});
+
+await test("an answer cut off at the limit says so", () => {
+  assert.match(describeStop("Long answer", "max_tokens")!, /cut off/);
+});
+
+await test("an empty answer with no reason still gets a message", () => {
+  assert.match(describeStop("", undefined)!, /empty answer/);
+  assert.match(describeStop("  \n", "end_turn")!, /empty answer/);
+});
+
+await test("the stop reason travels from the stream to the caller", async () => {
+  const result = await consumeChatStream(
+    streamOf([
+      { text: "", done: false, usage: { inputTokens: 10 } },
+      { text: "", done: true, stopReason: "refusal" },
+    ]),
+  );
+  assert.equal(result.stopReason, "refusal");
+  assert.equal(result.sawText, false);
+});
+
+/** A fetch stub that streams Anthropic server-sent events. */
+function stubAnthropicSse(events: Array<{ event: string; data: any }>): void {
+  (globalThis as any).fetch = async (url: string, init: any) => {
+    sent.push({ url, body: JSON.parse(init.body) });
+    const body = events
+      .map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`)
+      .join("");
+    return new Response(body, { status: 200 });
+  };
+}
+
+await test("Anthropic streaming reports a refusal's stop reason", async () => {
+  stubAnthropicSse([
+    { event: "message_start", data: { message: { usage: { input_tokens: 50 } } } },
+    {
+      event: "message_delta",
+      data: { delta: { stop_reason: "refusal" }, usage: { output_tokens: 0 } },
+    },
+    { event: "message_stop", data: {} },
+  ]);
+  const provider = new AnthropicProvider("test-key");
+  const result = await consumeChatStream(
+    provider.chatStream(MESSAGES, { model: "claude-haiku-5-5" }),
+  );
+  assert.equal(result.text, "");
+  assert.equal(result.stopReason, "refusal");
+  assert.match(describeStop(result.text, result.stopReason)!, /declined/);
+});
+
+await test("Anthropic streaming skips thinking deltas and keeps the text", async () => {
+  stubAnthropicSse([
+    { event: "message_start", data: { message: { usage: { input_tokens: 50 } } } },
+    { event: "content_block_delta", data: { delta: { type: "thinking_delta", thinking: "hmm" } } },
+    { event: "content_block_delta", data: { delta: { type: "text_delta", text: "Answer." } } },
+    { event: "message_delta", data: { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } } },
+    { event: "message_stop", data: {} },
+  ]);
+  const provider = new AnthropicProvider("test-key");
+  const result = await consumeChatStream(
+    provider.chatStream(MESSAGES, { model: "claude-haiku-5-5" }),
+  );
+  assert.equal(result.text, "Answer.");
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(result.usage?.outputTokens, 9);
+  assert.equal(describeStop(result.text, result.stopReason), undefined);
+});
+
+await test("Anthropic non-streaming exposes the stop reason", async () => {
+  nextResponse = { content: [], stop_reason: "refusal", usage: {} };
+  const provider = new AnthropicProvider("test-key");
+  const answer = await provider.chat(MESSAGES, { model: "claude-haiku-5-5" });
+  assert.equal(answer, "");
+  assert.equal(provider.lastChatStopReason(), "refusal");
+});
+
+// ---------------------------------------------------------------------------
+// §5.2 — Ollama request settings
+// ---------------------------------------------------------------------------
+
+console.log("\n=== §5.2: Ollama keep_alive and think ===\n");
+
+await test("every Ollama request asks to keep the model loaded", () => {
+  const provider = new OllamaProvider("http://localhost:11434", 16384);
+  for (const stream of [true, false]) {
+    const body: any = provider.buildRequestBody(MESSAGES, { model: "m" }, stream);
+    assert.equal(body.keep_alive, KEEP_ALIVE);
+  }
+  assert.equal(KEEP_ALIVE, "30m");
+});
+
+await test("think:false is sent for a model that can think", () => {
+  const options = {
+    model: "qwen3.5:4b",
+    ...chatOptionsFromModelInfo("ollama", {
+      capabilities: ["completion", "thinking", "vision"],
+    }),
+  };
+  const provider = new OllamaProvider("http://localhost:11434", 16384);
+  const body: any = provider.buildRequestBody(MESSAGES, options, true);
+  assert.equal(body.think, false);
+});
+
+await test("think is not sent for a model that cannot think, or is unknown", () => {
+  const provider = new OllamaProvider("http://localhost:11434", 16384);
+  for (const info of [{ capabilities: ["completion"] }, {}, undefined]) {
+    const options = { model: "m", ...chatOptionsFromModelInfo("ollama", info as any) };
+    const body: any = provider.buildRequestBody(MESSAGES, options, true);
+    assert.ok(!("think" in body), JSON.stringify(info));
+  }
+});
+
+await test("think is never set for cloud providers", () => {
+  assert.deepEqual(
+    chatOptionsFromModelInfo("anthropic", { capabilities: ["thinking"] }),
+    {},
+  );
 });
 
 // ---------------------------------------------------------------------------

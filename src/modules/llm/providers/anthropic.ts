@@ -23,6 +23,7 @@ import type {
   StreamChunk,
   TokenUsage,
 } from "../types";
+import { clampMaxTokens } from "../types";
 import { httpGet, httpPost } from "../../../utils/http";
 
 const ENDPOINT = "https://api.anthropic.com/v1/messages";
@@ -86,6 +87,9 @@ export class AnthropicProvider implements ILLMProvider {
   /** Usage from the most recent non-streaming `chat()` call, if reported. */
   private lastUsage: TokenUsage | undefined;
 
+  /** `stop_reason` from the most recent non-streaming `chat()` call. */
+  private lastStopReason: string | undefined;
+
   constructor(apiKey: string) {
     this.apiKey = apiKey;
   }
@@ -98,6 +102,14 @@ export class AnthropicProvider implements ILLMProvider {
    */
   lastChatUsage(): TokenUsage | undefined {
     return this.lastUsage;
+  }
+
+  /**
+   * Why the most recent non-streaming `chat()` call stopped (`end_turn`,
+   * `max_tokens`, `refusal`, …), for the same reason as {@link lastChatUsage}.
+   */
+  lastChatStopReason(): string | undefined {
+    return this.lastStopReason;
   }
 
   /**
@@ -145,7 +157,12 @@ export class AnthropicProvider implements ILLMProvider {
 
     return {
       model: options.model,
-      max_tokens: options.maxTokens ?? defaultMaxTokens,
+      // Clamped to the model's own limit: the defaults suit current models
+      // but exceed what an older pinned model accepts.
+      max_tokens: clampMaxTokens(
+        options.maxTokens ?? defaultMaxTokens,
+        options.modelMaxOutputTokens,
+      ),
       ...(systemParts.length > 0 && {
         system: [
           {
@@ -181,6 +198,8 @@ export class AnthropicProvider implements ILLMProvider {
     // Non-streaming has no chunk to carry usage on, so stash it for the
     // caller to read via lastChatUsage(). Used by the non-stream fallback path.
     this.lastUsage = this.parseUsage(data.usage);
+    this.lastStopReason =
+      typeof data?.stop_reason === "string" ? data.stop_reason : undefined;
     return extractAnthropicText(data);
   }
 
@@ -227,6 +246,8 @@ export class AnthropicProvider implements ILLMProvider {
     let buffer = "";
     /** Accumulated token accounting; merged across message_start/_delta. */
     let lastUsage: TokenUsage | undefined;
+    /** `stop_reason` from message_delta, reported on the final chunk. */
+    let stopReason: string | undefined;
 
     try {
       while (true) {
@@ -271,7 +292,12 @@ export class AnthropicProvider implements ILLMProvider {
 
           // Terminal: message_stop
           if (eventType === "message_stop") {
-            yield { text: "", done: true, ...(lastUsage && { usage: lastUsage }) };
+            yield {
+              text: "",
+              done: true,
+              ...(lastUsage && { usage: lastUsage }),
+              ...(stopReason && { stopReason }),
+            };
             return;
           }
 
@@ -283,6 +309,9 @@ export class AnthropicProvider implements ILLMProvider {
           ) {
             try {
               const data = JSON.parse(dataStr) as any;
+              if (typeof data.delta?.stop_reason === "string") {
+                stopReason = data.delta.stop_reason;
+              }
               const usage = this.parseUsage(
                 data.message?.usage ?? data.usage,
               );
@@ -311,7 +340,12 @@ export class AnthropicProvider implements ILLMProvider {
       }
 
       // Signal completion if stream ended without message_stop.
-      yield { text: "", done: true, ...(lastUsage && { usage: lastUsage }) };
+      yield {
+        text: "",
+        done: true,
+        ...(lastUsage && { usage: lastUsage }),
+        ...(stopReason && { stopReason }),
+      };
     } finally {
       controller.abort();
       try { reader.releaseLock(); } catch { /* ignore */ }

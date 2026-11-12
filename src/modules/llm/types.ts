@@ -58,6 +58,12 @@ export interface StreamChunk {
    * last — so callers should merge rather than overwrite.
    */
   usage?: TokenUsage;
+  /**
+   * Why the model stopped, when the provider reports it, in the provider's
+   * own vocabulary (Anthropic: `end_turn`, `max_tokens`, `refusal`, …).
+   * Interpreted by `describeStop()` in `./stream`.
+   */
+  stopReason?: string;
 }
 
 /** Options passed to a chat completion request. */
@@ -80,6 +86,35 @@ export interface ChatOptions {
    * supplied paper rarely needs more than "low" or "medium".
    */
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /**
+   * The model's own output-token limit, when discovery reported one. A
+   * provider's default or requested `maxTokens` is clamped to it, so an older
+   * model with a small limit does not reject the request outright.
+   */
+  modelMaxOutputTokens?: number;
+  /**
+   * Ollama only: `false` asks a thinking-capable model not to think. Set only
+   * for models that report the `thinking` capability; omitted otherwise so the
+   * field is never sent to a model that does not know it.
+   */
+  think?: boolean;
+}
+
+/**
+ * Clamps an output-token request to a model's limit.
+ *
+ * @param requested - Tokens the request would ask for.
+ * @param modelLimit - The model's limit, or `undefined` when unknown.
+ */
+export function clampMaxTokens(requested: number, modelLimit?: number): number {
+  if (
+    typeof modelLimit === "number" &&
+    Number.isFinite(modelLimit) &&
+    modelLimit > 0
+  ) {
+    return Math.min(requested, Math.floor(modelLimit));
+  }
+  return requested;
 }
 
 /**

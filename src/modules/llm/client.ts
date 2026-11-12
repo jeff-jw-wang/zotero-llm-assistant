@@ -34,6 +34,7 @@ import {
   pickModel,
   resolveInputBudget,
   resolveContextWindow,
+  type ModelInfo,
 } from "./models";
 import { planPrompt, type PromptPlan } from "./budget";
 
@@ -276,7 +277,40 @@ export async function resolveChatOptions(): Promise<ChatOptions> {
   const model = await resolveModelId(provider);
   const effort =
     provider === "anthropic" ? prefs.getAnthropicEffort() : "";
-  return { model, stream: true, ...(effort && { effort }) };
+
+  // What discovery knows about this model. Served from the session cache that
+  // resolveModelId() just filled, and never throws.
+  const info = (await listModels(provider, providerCredentials(provider))).find(
+    (m) => m.id === model,
+  );
+
+  return {
+    model,
+    stream: true,
+    ...(effort && { effort }),
+    ...chatOptionsFromModelInfo(provider, info),
+  };
+}
+
+/**
+ * The request options that follow from what discovery reported about a model.
+ *
+ * - The model's output-token limit, so requests can be clamped to it.
+ * - For Ollama models that can think: `think: false`. A small model thinking
+ *   on a laptop CPU multiplies the wait for little gain on grounded Q&A.
+ *
+ * Pure. An unknown model (`info` undefined) yields no options.
+ */
+export function chatOptionsFromModelInfo(
+  provider: prefs.ProviderName,
+  info: Pick<ModelInfo, "maxOutputTokens" | "capabilities"> | undefined,
+): Pick<ChatOptions, "modelMaxOutputTokens" | "think"> {
+  if (!info) return {};
+  return {
+    ...(info.maxOutputTokens && { modelMaxOutputTokens: info.maxOutputTokens }),
+    ...(provider === "ollama" &&
+      info.capabilities?.includes("thinking") && { think: false }),
+  };
 }
 
 /**

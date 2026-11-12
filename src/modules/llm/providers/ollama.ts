@@ -29,6 +29,13 @@ const DEFAULT_ENDPOINT = "http://localhost:11434";
  */
 export const DEFAULT_NUM_CTX = 16_384;
 
+/**
+ * How long Ollama keeps the model loaded after a request. Long enough to read
+ * a few pages between questions; short enough to give the memory back the
+ * same afternoon.
+ */
+export const KEEP_ALIVE = "30m";
+
 /** Connection timeout (ms) — fires if no response data arrives within this window. */
 const CONNECTION_TIMEOUT_MS = 15_000;
 
@@ -76,6 +83,12 @@ export class OllamaProvider implements ILLMProvider {
       model: options.model,
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
       stream,
+      // Keep the model, and its already-read prompt, in memory between
+      // questions. Ollama's default unloads after five minutes, after which a
+      // follow-up re-reads the whole paper — minutes on a CPU-only laptop.
+      keep_alive: KEEP_ALIVE,
+      // Only sent when the caller knows the model can think (see ChatOptions).
+      ...(options.think !== undefined && { think: options.think }),
       options: {
         num_ctx: this.numCtx,
         ...(options.temperature != null && { temperature: options.temperature }),

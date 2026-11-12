@@ -49,7 +49,7 @@ import {
 } from "../llm/client";
 import type { PipelineResult } from "../rag/pipeline";
 import { describeSelection, describeDroppedHistory } from "../rag/notes";
-import { consumeChatStream } from "../llm/stream";
+import { consumeChatStream, describeStop } from "../llm/stream";
 import { OllamaProvider } from "../llm/providers/ollama";
 import {
   appendMessage as dbAppendMessage,
@@ -456,6 +456,8 @@ async function handleQuestion(
   let usedStream = true; // Flipped to false if streaming fails and we fall back to chat().
   /** Token accounting reported by the provider, if any. */
   let usage: TokenUsage | undefined;
+  /** Why the model stopped, where the provider reports it. */
+  let stopReason: string | undefined;
 
   try {
     // Build conversation history for the pipeline.
@@ -474,6 +476,8 @@ async function handleQuestion(
       history = (record?.messages ?? [])
         .filter((m) => m.role !== "system")
         .slice(0, -1) // exclude the just-saved current question
+        // An empty turn is not a turn: providers reject empty content.
+        .filter((m) => m.content.trim().length > 0)
         .slice(-MAX_CONTEXT_HISTORY_MESSAGES) // keep recent turns to preserve RAG context budget
         .map((m) => ({
           role: m.role as "user" | "assistant",
@@ -560,6 +564,7 @@ async function handleQuestion(
         },
       );
       if (streamed.usage) usage = { ...(usage ?? {}), ...streamed.usage };
+      stopReason = streamed.stopReason;
     } catch (streamErr: any) {
       if (!shouldRetryNonStream(streamErr)) {
         throw streamErr;
@@ -581,6 +586,7 @@ async function handleQuestion(
       // it via lastChatUsage().
       const reported = (provider as any).lastChatUsage?.();
       if (reported) usage = { ...(usage ?? {}), ...reported };
+      stopReason = (provider as any).lastChatStopReason?.();
       scrollState.stick = isNearBottom(messages);
       renderResponseWithCitations(
         assistantBubble,
@@ -606,6 +612,14 @@ async function handleQuestion(
     if (fullResponse) {
       appendCopyButton(assistantBubble, doc, () => fullResponse);
     }
+
+    // A refusal, a cut-off answer or no answer at all gets an explanation
+    // instead of a blank or silently truncated bubble.
+    const stopNote = describeStop(fullResponse, stopReason);
+    if (stopNote) {
+      if (!fullResponse.trim()) assistantBubble.remove();
+      appendSystemNote(messages, doc, `\u26a0 ${stopNote}`, scrollState.stick);
+    }
   } catch (err) {
     // Clean up the status note before re-throwing — the caller renders the error.
     removeStatusNote(statusNote);
@@ -626,21 +640,25 @@ async function handleQuestion(
       };
     });
 
-  // Fire-and-forget: persistence must never block UI completion.
-  void withTimeout(
-    dbAppendMessage(item.id, {
-      role: "assistant",
-      content: fullResponse,
-      timestamp: new Date().toISOString(),
-      sourceChunks: sourceChunks.length > 0 ? sourceChunks : undefined,
-      // Recorded so history replay can validate [p.N] citations later.
-      pageCount: pipeline.pageCount,
-    }),
-    DB_OP_TIMEOUT_MS,
-    "save assistant message",
-  ).catch((dbErr: any) => {
-    ztoolkit.log("Failed to save assistant message to DB:", dbErr?.message ?? dbErr);
-  });
+  // Fire-and-forget: persistence must never block UI completion. An empty
+  // answer is not saved: it would be replayed to the model as an empty
+  // assistant turn on the next question, which providers reject.
+  if (fullResponse.trim()) {
+    void withTimeout(
+      dbAppendMessage(item.id, {
+        role: "assistant",
+        content: fullResponse,
+        timestamp: new Date().toISOString(),
+        sourceChunks: sourceChunks.length > 0 ? sourceChunks : undefined,
+        // Recorded so history replay can validate [p.N] citations later.
+        pageCount: pipeline.pageCount,
+      }),
+      DB_OP_TIMEOUT_MS,
+      "save assistant message",
+    ).catch((dbErr: any) => {
+      ztoolkit.log("Failed to save assistant message to DB:", dbErr?.message ?? dbErr);
+    });
+  }
 
   // Diagnostics footer — model · host · transport · context mode · tokens,
   // plus cache accounting when the provider reports it.

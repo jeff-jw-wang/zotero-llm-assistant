@@ -23,6 +23,8 @@ declare namespace _ZoteroTypes {
       "llm.custom.endpoint": string;
       "llm.custom.apiKey": string;
       "llm.custom.model": string;
+      "context.wholePaperMaxTokens": number;
+      "context.retrievedMaxTokens": number;
       "embeddings.methodVersion": number;
       "onboarding.completed": boolean;
     };
