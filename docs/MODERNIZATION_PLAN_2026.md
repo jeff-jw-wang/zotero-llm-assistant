@@ -10,27 +10,28 @@ review got wrong, and what to do next, in order.
 
 ## 1. Start here
 
-**State of the code.** Branch `claude/confident-bardeen-j2v7eq` is four feature
-commits ahead of `develop` and is **not merged**. It contains three phases of
-changes (v0.2.0 → v0.4.0) on top of the released v0.1.1b.
+**State of the code.** Branch `claude/confident-bardeen-j2v7eq` is **not
+merged**. It contains three phases of changes (v0.2.0 → v0.4.0) on top of the
+released v0.1.1b, plus milestone M1 (v0.4.1), which fixes the four defects
+that broke default behaviour (D1–D4) and two smaller ones (D8, D17). See §4
+for what each fix did.
 
-**Do not merge or release it yet.** A second, critical read of the branch found
-four defects that break default behaviour (§4, P0), including one that makes
-the OpenAI and Gemini providers pick an unusable model out of the box. In
-v0.1.1b those providers worked.
+**Do not merge or release it yet.** M1 is code and unit tests only. The
+runtime check in Zotero (§7) has not been run, and it is the gate.
 
-**What has been verified:** TypeScript compiles, 212 unit tests pass, the XPI
-builds. **What has not:** the plugin has never been run inside Zotero since
-these changes, and no request has been sent to any provider. Every statement
+**What has been verified:** TypeScript compiles, 251 unit tests pass, the XPI
+builds as v0.4.1. **What has not:** the plugin has never been run inside
+Zotero since these changes, and no request has been sent to any provider. Every statement
 about runtime behaviour below is from reading code and documentation. Facts
 about Ollama, Hugging Face and OpenAI were checked against their own sites on
 12 November 2026; Gemini facts were not (§8).
 
 **Next steps, in order:**
 
-1. Fix the P0 defects (§4.1). Pure code plus unit tests; needs no Zotero.
-2. Build the XPI and run the 15-minute runtime checklist in Zotero (§7). Only
-   the repository owner can do this — a cloud session has no Zotero.
+1. ~~Fix the P0 defects (§4.1).~~ Done in M1, 12 November 2026.
+2. Run the 15-minute runtime checklist in Zotero (§7) on the v0.4.1 build.
+   Only the repository owner can do this — a cloud session has no Zotero.
+   **This is the current step.** Record results in §7.1.
 3. Fix the P1 defects and adopt the revised context policy (§5.2).
 4. Add sign-in with a ChatGPT plan (§5.4, milestone M4). The owner has ChatGPT
    Plus, and this is now officially supported for apps like this one.
@@ -84,6 +85,8 @@ Zotero with Tools → Add-ons → gear → Install Add-on From File.
 | `a42b0b6` | 0.2.0 | Model discovery (`src/modules/llm/models.ts`), input budgets from the provider's context window instead of a hardcoded table, "auto" model selection, Anthropic request-shape updates, settings controls (Detect button, Ollama context size, Anthropic effort). |
 | `904ef9d` | 0.3.0 | Whole-paper context mode with a stable prompt prefix, Anthropic `cache_control`, page citations `[p.N]`, token/cache counts in the footer (Anthropic only). |
 | `98b21a0` | 0.4.0 | Library search by rank fusion of keyword and embedding rankings, windowed embedding of long text, 1500-character abstracts, "from general knowledge" answer section. |
+
+| M1 commits | 0.4.1 | Fixes for D1, D2, D3, D4, D8, D17, one commit each (`fix(D1)` … `fix(D17)`). New: `pickModel()` and Ollama capability discovery in `models.ts`, `src/modules/llm/stream.ts`, `test/m1-fixes.test.ts`. |
 
 New tests: `test/models.test.ts`, `test/caching.test.ts`,
 `test/library-retrieval.test.ts`. They cover pure functions only. Nothing tests
@@ -224,6 +227,25 @@ commit `98b21a0`.
 ### 4.1 P0 — fix before anyone installs this build
 
 **D1. Automatic model selection picks non-chat or retired models.**
+**— FIXED in M1 (unit-tested; not yet run in Zotero).**
+- *What the fix does:* `pickModel(provider, models)` in
+  `src/modules/llm/models.ts` is pure. It takes the first offered ID from
+  `PREFERRED_MODELS` (`qwen3.5:4b` then `qwen3.5:2b` for Ollama,
+  `claude-haiku-5-5`, `gpt-6-luna`, `gemini-flash-latest`), accepting a dated
+  snapshot of a preferred ID but nothing looser. Failing that it uses the only
+  chat-capable model, if there is exactly one. Otherwise it returns nothing and
+  the user sees "Could not choose a model automatically… press Detect".
+  Ollama discovery now calls `/api/show` per installed model and drops any
+  whose `capabilities` lack `completion`, so embedding models no longer appear
+  in the Detect list either.
+- *Consequence to check at runtime:* **Gemini has no verified default.**
+  `gemini-flash-latest` is from memory; Google's documentation could not be
+  reached. If Gemini's model list does not contain that exact ID, a Gemini user
+  with an empty Model field is asked to choose. That is the intended safe
+  failure, but it is worse than v0.1.1b's pinned default, so fix the list as
+  soon as a real Gemini model list is available (§7 step 8 captures one).
+- *Also changed:* an Ollama install with several chat models and neither
+  preferred tag now asks the user to choose rather than taking the first.
 - *Where:* `src/modules/llm/client.ts:202` (`MODEL_PREFERENCE`), `:216`
   (`versionScore`), `:234` (`resolveModelId`); `src/modules/llm/models.ts:312`
   (`listOllamaModels`).
@@ -259,6 +281,10 @@ commit `98b21a0`.
   including the four cases above.
 
 **D2. The Ollama context-size setting is never sent to Ollama.**
+**— FIXED in M1 (unit-tested; confirm with `ollama ps`, §7 step 3).**
+`OllamaProvider` takes the size in its constructor and both request paths
+send it. The plan missed a second construction site: `createBestAvailable()`
+in `client.ts` also built a provider used for chat; both now pass the setting.
 - *Where:* `src/modules/llm/providers/ollama.ts:26`, `:63`, `:112` hardcode
   `num_ctx: 16384`. `getOllamaNumCtx()` is read only for the budget
   (`client.ts:326`) and the settings field.
@@ -269,12 +295,14 @@ commit `98b21a0`.
   request body in a test.
 
 **D3. The new Detect buttons have no label.**
+**— FIXED in M1 (locale file checked by a test; confirm visually, §7 step 1).**
 - *Where:* `addon/locale/en-US/preferences.ftl:5` defines
   `pref-detect-models = Detect`. Buttons in this file use the attribute form
   (see lines 13–16): `pref-detect-models =` followed by `.label = Detect`.
 - *Effect:* four blank buttons, very likely. Confirm at runtime.
 
 **D4. The Anthropic non-streaming path returns an empty answer.**
+**— FIXED in M1 (unit-tested against a thinking-first response body).**
 - *Where:* `src/modules/llm/providers/anthropic.ts:162` returns
   `content[0].text`.
 - *Why:* Haiku 5.5, the new default, has thinking on by default, so the first
@@ -316,6 +344,10 @@ differently there too; the threshold was not captured, so check it before
 raising any OpenAI limit.
 
 **D8. The "analysing paper…" note disappears before any text arrives.**
+**— FIXED in M1.** The stream loop moved to `consumeChatStream()` in
+`src/modules/llm/stream.ts`, which is DOM-free and unit-tested. The library
+panel (`libraryPanel.ts:821`) has its own loop and no status note; it was not
+changed.
 `readerPanel.ts:526` treats the first stream event as the first text, but the
 first event is now a usage report. With a thinking model the user sees an empty
 bubble during the thinking pause. *Fix:* only a chunk with text counts.
@@ -357,7 +389,7 @@ these.
   (`client.ts:270`) rather than "Ollama is not running".
 - **D16.** Once items are embedded, library search always returns ten results,
   however irrelevant; there is no minimum similarity.
-- **D17.** Misleading text: `preferences.ftl:28` promises a 25 MB model
+- **D17. — FIXED in M1.** Misleading text: `preferences.ftl:28` promises a 25 MB model
   download that probably never succeeds; `src/utils/tokens.ts:7` says the
   estimate errs high (it errs low); the comment in correction 9.
 - **D18.** The Gemini key is sent in the URL query string (existing behaviour,
@@ -679,6 +711,24 @@ and search for `Zotero LLM Assistant`.
 8. **Other providers you use.** One question each on OpenAI and Gemini with
    the model field empty.
 
+**Expected differences from the checklist as first written, after M1:**
+
+- Step 3: with several Ollama chat models installed and neither `qwen3.5:4b`
+  nor `qwen3.5:2b` among them, Detect reports "No automatic choice" and the
+  first question asks you to choose. That is intended. With one chat model, or
+  with a preferred tag installed, it is selected. Embedding models should not
+  appear in the Detect list at all.
+- Step 3: `ollama ps` should show the context size from the Context size
+  setting. Change the setting, ask again, and check it follows.
+- Step 8: OpenAI with an empty Model field should select `gpt-6-luna`. Gemini
+  will probably ask you to choose (see D1). **Please copy the full Detect
+  output for Gemini into §7.1** — it is the model list this plan lacks.
+
+### 7.1 Results
+
+Not yet run. Record here, per step: what happened, the Zotero version, the
+operating system and machine, and any lines from the debug output.
+
 ---
 
 ## 8. External facts and how sure we are
@@ -779,18 +829,21 @@ question is the wrong default at this size.
 - A cloud session cannot run Zotero. It can change code, run the unit tests and
   build the XPI; runtime results must come from the owner.
 - A cloud environment named `zotero-llm-assistant` now exists for this
-  repository. Start the next session in it. It allows `ollama.com`,
+  repository. Start the next session in it. It is meant to allow `ollama.com`,
   `docs.ollama.com`, `huggingface.co`, `platform.openai.com`,
-  `developers.openai.com` and `ai.google.dev`, and installs dependencies at
-  start-up with `npm ci`. That start-up script has not yet run in a fresh
-  session. To read Gemini's documentation, `aistudio.google.com` still needs
+  `developers.openai.com` and `ai.google.dev` — but on 12 November 2026 the
+  M1 session got a proxy refusal (403) for `ai.google.dev`, so no Gemini
+  documentation is reachable at all. It installs dependencies at
+  start-up with `npm ci`; `node_modules` was present when the M1 session
+  started. To read Gemini's documentation, `aistudio.google.com` still needs
   adding.
 - Live API checks need a key for the provider's API host, entered through the
   session's credential form, never pasted into chat.
 - `CLAUDE.md`, `AGENT.md` and `ROADMAP.md` are deliberately untracked in this
   repository; this file is the shared plan.
 - Unit tests are standalone `tsx` scripts using Node's `assert`; follow the
-  pattern in `test/models.test.ts`. Modules that read preferences need the
+  pattern in `test/models.test.ts`. `test/m1-fixes.test.ts` shows how to stub
+  `Zotero.HTTP.request` and `fetch` to capture what a provider sends. Modules that read preferences need the
   small `Zotero` stub shown in `test/caching.test.ts`.
 - Any change to how text becomes a vector must bump
   `EMBEDDING_METHOD_VERSION` in `src/modules/rag/embedder.ts`.
