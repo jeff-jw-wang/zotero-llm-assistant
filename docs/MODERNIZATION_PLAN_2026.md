@@ -22,7 +22,9 @@ v0.1.1b those providers worked.
 **What has been verified:** TypeScript compiles, 212 unit tests pass, the XPI
 builds. **What has not:** the plugin has never been run inside Zotero since
 these changes, and no request has been sent to any provider. Every statement
-about runtime behaviour below is from reading code and documentation.
+about runtime behaviour below is from reading code and documentation. Facts
+about Ollama, Hugging Face and OpenAI were checked against their own sites on
+12 November 2026; Gemini facts were not (§8).
 
 **Next steps, in order:**
 
@@ -32,8 +34,10 @@ about runtime behaviour below is from reading code and documentation.
 3. Fix the P1 defects and adopt the revised context policy (§5.2).
 4. Rebuild library search on a real semantic signal (§5.3). The current one is
    not semantic in practice (§3, correction 3).
+5. Optionally, add sign-in with a ChatGPT plan (§5.4). This is independent of
+   the steps above and is now officially supported for apps like this one.
 
-**Three things the first review told you that were wrong** (details in §3):
+**Four things the first review told you that were wrong** (details in §3):
 
 - "The whole PDF is not being re-sent." For a normal-length paper on a cloud
   provider, v0.1.1b *did* re-send essentially the whole paper on every
@@ -44,6 +48,10 @@ about runtime behaviour below is from reading code and documentation.
 - "Library search is now semantic." In the shipped plugin the embedding model
   most likely never loads, and the fallback is word-and-trigram hashing. The
   retrieval restructuring is sound; the semantic signal feeding it is not there.
+- "Subscription login is limited to launch partners; don't build it." Out of
+  date for ChatGPT: OpenAI documents a sign-in flow that lets open-source,
+  locally run apps use a person's Plus or Pro plan. Claude remains API-key
+  only.
 
 **Commands.**
 
@@ -197,6 +205,14 @@ that the stable prefix helps them is an untested assumption (D9).
 tokens and the minimum cacheable prefix is 512 tokens on current Claude models.
 The breakpoint on it is harmless but does nothing by itself.
 
+**10. "Sign in with ChatGPT is limited to about sixteen launch partners; do not
+build it."**
+That came from news coverage. OpenAI's developer documentation, read directly
+on 12 November 2026, says plan usage "is available to all open-source partners
+and selected private clients" and documents a self-service flow for
+open-source and locally hosted apps. This plugin qualifies on both counts.
+*Consequence:* subscription login is feasible for ChatGPT (§5.4).
+
 ---
 
 ## 4. Defects found on the branch
@@ -214,12 +230,13 @@ commit `98b21a0`.
 - *Why it is P0:* Phase 1 changed the OpenAI, Gemini and Ollama model settings
   to default to empty, meaning "choose automatically". This is the default
   path for three of four providers.
-- *Evidence:* running the selection logic over realistic model lists
-  (illustrative lists, not live API output):
+- *Evidence:* running the selection logic over model lists. The OpenAI list is
+  the set of model IDs on OpenAI's pricing page on 12 November 2026; the
+  others are illustrative:
 
   | Provider | Selected | Problem |
   |---|---|---|
-  | OpenAI | `gpt-realtime-mini-2025-12-15` | realtime audio model |
+  | OpenAI | `gpt-realtime-2.1-mini` | realtime audio model |
   | Gemini | `gemini-3.1-flash-image-preview` | image model |
   | Anthropic, if the pinned default is cleared | `claude-3-haiku-20240307` | retired |
   | Ollama without a Qwen3.5 model | `qwen3-embedding:0.6b` | embedding model |
@@ -227,13 +244,17 @@ commit `98b21a0`.
 - *Causes:* `versionScore` reads the first two numbers in the ID, so a date
   stamp outranks a version; the patterns (`/mini/`, `/flash/`, `/qwen3/`) are
   unanchored; nothing filters by what a model can do.
-- *Fix:* match only anchored chat-model families (for example
-  `^gpt-\d+(\.\d+)?-mini$`), read the version from that match alone, prefer
-  undated aliases, and exclude IDs containing modality words (embed, tts,
-  transcribe, realtime, audio, image, live). For Ollama, exclude embedding
-  models — by the capabilities reported by `/api/show` if available, otherwise
-  by name. Keep one pinned last-resort default per provider for when discovery
-  returns nothing.
+- *Why patterns cannot be patched:* OpenAI's four current chat models are
+  `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra` and `gpt-6-luna`. None contains
+  "mini". Providers rename their tiers faster than a pattern list can follow.
+- *Fix:* stop inferring from names. Keep a short ordered list of exact
+  preferred IDs per provider (today `gpt-6-luna` for OpenAI and
+  `claude-haiku-5-5` for Anthropic), use the first one the provider's model
+  list contains, and otherwise ask the user to choose from the Detect list.
+  That list will also go stale, but it fails to "please choose a model" rather
+  than to a wrong model. For Ollama, `/api/show` returns a `capabilities` list
+  (documented values include `completion`, `thinking`, `vision`); offer only
+  models that have `completion`.
 - *Test:* extract a pure `pickModel(provider, ids)` and add fixture lists,
   including the four cases above.
 
@@ -289,7 +310,10 @@ Haiku 5.5 is billed 5× more per token above 100K prompt tokens. The band cap
 tokenizer counts about 30% more, so an estimated 88K can be a real 115K. This
 only affects documents above roughly 300K characters.
 *Fix:* apply a tokenizer factor of 1.35 for current Claude models, or call
-Anthropic's free token-counting endpoint.
+Anthropic's free token-counting endpoint. OpenAI's pricing page also offers a
+short/long context-length selector, which suggests long prompts are priced
+differently there too; the threshold was not captured, so check it before
+raising any OpenAI limit.
 
 **D8. The "analysing paper…" note disappears before any text arrives.**
 `readerPanel.ts:526` treats the first stream event as the first text, but the
@@ -301,8 +325,11 @@ Needed: OpenAI — request `stream_options: {include_usage: true}` and read
 `usage.prompt_tokens_details.cached_tokens`; Gemini — read
 `usageMetadata.cachedContentTokenCount`; Ollama — read `prompt_eval_count` and
 `eval_count` from the final stream object (a small `prompt_eval_count` on a
-follow-up shows the prefix was reused). Field names are from memory of each
-API; verify against a live response.
+follow-up shows the prefix was reused). Ollama's field names are confirmed in
+its API documentation. OpenAI's documentation confirms `cached_tokens`, under
+`usage.input_tokens_details` in the Responses API; the Chat Completions
+spelling this plugin would need and the Gemini field are from memory — verify
+against a live response.
 
 **D10. `max_tokens` is not clamped to the model's limit.** The defaults (16K
 non-streaming, 64K streaming, `anthropic.ts:40`) are rejected by older models a
@@ -361,6 +388,21 @@ the cost of a one-question session. On Haiku the difference is a tenth of a
 cent. Recommendation: keep 1 hour, and skip the cache marker entirely when the
 paper is small enough that caching cannot matter.
 
+**OpenAI, for comparison.** From OpenAI's pricing page on 12 November 2026, per
+million tokens:
+
+| Model | Input | Output | Cached input |
+|---|---|---|---|
+| `gpt-6-luna` | $0.10 | $0.50 | $0.01 |
+| `gpt-6.1-terra` | $1.00 | $5.00 | $0.05 |
+| `gpt-6.1-sol` | $2.00 | $10.00 | $0.10 |
+| `gpt-6-astra` | $10.00 | $50.00 | $1.00 |
+
+Caching is on by default, but these models bill cache *writes* at 1.25× (a
+30-minute lifetime) or 2.5× (12 hours), so the table in §3 applies to OpenAI
+almost unchanged. `gpt-6-luna` costs the same as Haiku 5.5 and is the natural
+OpenAI default.
+
 ### 5.2 Context policy v2
 
 Replace "send whatever fits the window" with explicit limits and one retrieval
@@ -389,11 +431,15 @@ The prefix stays byte-identical, so cloud caching works on large documents and
 Ollama reuses its state on follow-ups, while each question still gets targeted
 evidence. Citations validate against core and supplement together.
 
-**Ollama request settings to add and verify at runtime:** the context size from
-the setting (D2); `keep_alive` long enough that the model is not unloaded
-between questions (the default is about five minutes, after which the whole
-prompt is re-read); and thinking disabled for models that support it, since a
-small model thinking on a laptop CPU is slow.
+**Ollama request settings to add.** All three are in Ollama's API
+documentation: the context size, `options.num_ctx`, from the setting (D2);
+`keep_alive`, long enough that the model is not unloaded between questions
+(the default is five minutes, after which the whole prompt is re-read); and
+`think: false` for models that support thinking, since a small model thinking
+on a laptop CPU is slow. Thinking text arrives in a separate `message.thinking`
+field, so it will not leak into answers. Note that Ollama's own default context
+is only 4K tokens on machines with under 24 GB of video memory — the plugin
+must always send its own value.
 
 ### 5.3 Library search v2
 
@@ -418,15 +464,27 @@ your own suggestion, implemented directly, and it needs no embeddings.
   retrieval as today.
 
 **2. A real semantic signal, through Ollama.** Add an embedding backend that
-calls Ollama's `/api/embed` endpoint. It runs outside Zotero, so the ONNX
-problem disappears. Candidate models (sizes from secondary sources): 
-`all-minilm` (~46 MB, 384 dimensions — the same size as today's vectors, but a
-256-token input limit, so the windowing code still earns its keep),
-`nomic-embed-text` (~274 MB, 768 dimensions, long input), `embeddinggemma`
-(768 dimensions, ~2K-token input). Detect which is installed; record the
-embedding identity with the vectors (D12). Keep hashing as the last resort and
-label it honestly in the UI. Decide whether to keep the Transformers.js
-dependency at all; if it cannot be made to load, remove it.
+calls Ollama's `/api/embed` endpoint. It is documented, accepts a batch of
+inputs, and returns unit-length vectors. It runs outside Zotero, so the ONNX
+problem disappears. Models in Ollama's library, as listed on 12 November 2026:
+
+| Model | Download | Input limit | Note |
+|---|---|---|---|
+| `all-minilm` | 46 MB | 512 tokens | 384 dimensions, the same as today's vectors |
+| `nomic-embed-text` | 274 MB | 2K tokens | |
+| `embeddinggemma` | 622 MB | 2K tokens | The model Ollama's own embedding guide uses; needs a recent Ollama |
+
+On 8 GB, `all-minilm` or `nomic-embed-text` can stay loaded beside the chat
+model; Ollama keeps up to three models loaded when memory allows. Detect which
+is installed and record the embedding identity with the vectors (D12). Keep
+hashing as the last resort and label it honestly in the UI.
+
+The in-Zotero route is blocked on the runtime, not on the models: the pinned
+`Xenova/all-MiniLM-L6-v2` revision is still that repository's head, and
+`onnx-community/embeddinggemma-300m-ONNX` exists (Gemma licence; no 16-bit
+float variants; expects fixed query and document prefixes). Neither helps until
+the ONNX runtime loads inside Zotero. If it cannot be made to load, remove the
+Transformers.js dependency.
 
 **3. Conversation and depth.** Library chat is currently single-turn
 (`src/modules/ui/libraryPanel.ts:804` sends no history), so "tell me more about
@@ -441,32 +499,71 @@ library is indexed today), and a minimum-similarity floor (D16).
 
 ### 5.4 Using a subscription instead of an API key
 
-- **Claude:** not possible inside a third-party plugin. Anthropic's consumer
-  terms forbid sharing account credentials and forbid automated access except
-  through an API key. Unchanged.
-- **ChatGPT:** "Sign in with ChatGPT" is now live, with developer
-  documentation at `developers.openai.com/siwc/quickstart`. Using a person's
-  plan allowance requires the *app* to be approved by OpenAI for plan usage,
-  and is available to Go, Plus and Pro subscribers. A personal plugin would
-  have to apply. Read the developer page before deciding; it was not reachable
-  from the sessions that wrote this document.
-- **An approach that works today:** connect Zotero to the Claude desktop app
-  through a Model Context Protocol (MCP) server, so the official app — and your
-  subscription — does the model work. Community servers exist (for example
-  `kujenga/zotero-mcp`, which can search the library and read full text through
-  Zotero's local API). The trade-off is that the conversation happens in the
-  Claude app, not in Zotero's side panel. This needs no change to this plugin
-  and is worth trying before investing in subscription login.
-- **Gemini's free API tier** remains a no-cost cloud option the plugin already
-  supports.
+**Claude: no.** Anthropic's consumer terms forbid sharing account credentials
+and forbid automated access except through an API key. Unchanged.
+
+**ChatGPT: yes, for this plugin.** OpenAI's developer documentation describes
+"ChatGPT plan usage" for open-source and locally hosted apps, and states that
+it "is available to all open-source partners and selected private clients". No
+approval step or client secret appears in the open-source flow; paid or
+remotely hosted apps are sent to an interest form instead. This plugin is open
+source and runs locally. The feature is a preview, and eligible users are on
+ChatGPT Plus or Pro.
+
+How it works, per the documentation:
+
+- Sign-in is OAuth with PKCE in the system browser, at
+  `https://auth.openai.com/api/accounts/authorize`, sending
+  `client_id=dynamic_agent_client` the first time. The callback returns a
+  client ID issued to this installation, which is reused afterwards.
+- The callback must be an HTTP listener on `127.0.0.1` — not `localhost`. Only
+  the port may differ between sign-ins.
+- Scopes: `openid profile email offline_access resource.invoke
+  chatgpt.tokens.use.direct`.
+- Tokens come from `https://auth.openai.com/api/accounts/oauth/token`. Access
+  tokens last one hour. Refresh tokens last 30 days and are replaced on every
+  refresh.
+- Requests go to `POST https://api.openai.com/v1/responses` with the access
+  token as the bearer credential. They must set `store: false` and
+  `stream: true`, give instructions through `instructions` rather than a system
+  message, and omit `temperature`, `max_output_tokens` and several other
+  fields.
+- The account's models come from `GET https://api.openai.com/v1/models` with
+  the same token.
+- When the plan's allowance for the app runs out, the stream fails with
+  `subscription_sharing_usage_limit_exceeded`.
+
+What it would take here:
+
+- A new provider for the Responses API. The existing OpenAI provider uses Chat
+  Completions and sends a system message, both of which this route rejects.
+- A loopback listener inside Zotero. Zotero already runs a local HTTP server
+  for its browser connector and plugins can add endpoints to it; whether that
+  address and a plugin-chosen path satisfy OpenAI's callback rules must be
+  tested first, because everything else depends on it.
+- ID-token signature checking, token refresh, and credential storage better
+  than the plain-text preferences that hold API keys today.
+- The "Continue with ChatGPT" button and branding from OpenAI's UI guidelines.
+
+This is milestone M4 in §6. It does not depend on the library work.
+
+**For Claude subscribers, an indirect route.** Connect Zotero to the Claude
+desktop app through a Model Context Protocol (MCP) server, so the official app
+— and the subscription — does the model work. Community servers exist (for
+example `kujenga/zotero-mcp`, which can search the library and read full text
+through Zotero's local API). The conversation then happens in the Claude app,
+not in Zotero's side panel. It needs no change to this plugin.
+
+**Gemini's free API tier** remains a no-cost cloud option the plugin already
+supports.
 
 ### 5.5 Local model for an 8 GB laptop
 
-- **Chat model:** Qwen3.5 4B, Ollama tag `qwen3.5:4b` — about 3.4 GB at 4-bit
-  quantization, roughly 6 GB of memory needed, 256K advertised context. Several
-  independent secondary sources agree on these figures; confirm on the Ollama
-  library page or with `ollama show qwen3.5:4b`. If it is too slow,
-  `qwen3.5:2b`.
+- **Chat model:** Qwen3.5 4B, Ollama tag `qwen3.5:4b`. Confirmed on Ollama's
+  library page: 3.3–4.0 GB depending on quantization, 256K advertised context,
+  text and image input. If it is too slow, `qwen3.5:2b` (2.7–3.1 GB).
+  **Pull the tag explicitly.** Bare `qwen3.5` resolves to the 9B model
+  (6.6–7.6 GB), which will not run acceptably in 8 GB.
 - **The open question is speed, not size.** On Apple Silicon a 12K-token paper
   is read in tens of seconds. On a laptop CPU without a usable GPU it can take
   minutes per question unless the prefix is reused. Measure with
@@ -525,11 +622,25 @@ Done when:
   private items, and is behind its own consent setting.
 - Library chat carries conversation history.
 
+### M4 — Sign in with a ChatGPT plan (optional, independent of M2 and M3)
+
+Scope: §5.4.
+
+Done when:
+- A short experiment in Zotero shows a loopback callback is received and a
+  token obtained. Do this first; if Zotero cannot host the callback, stop.
+- A Responses API provider streams an answer with that token. Unit tests cover
+  the request shape (no system message, `store: false`, `stream: true`,
+  unsupported fields absent) and the stream parser.
+- Tokens refresh before expiry, survive a Zotero restart, and are not stored
+  in plain-text preferences.
+- Usage-limit and revoked-consent errors show a clear message.
+
 ### Later
 
 Filters, survey mode, on-demand full text for top results, group libraries,
-dependency majors, "Sign in with ChatGPT" if approval is feasible, moving API
-keys out of plain-text preferences, tool-calling retrieval.
+dependency majors, moving API keys out of plain-text preferences, tool-calling
+retrieval.
 
 ---
 
@@ -564,22 +675,28 @@ and search for `Zotero LLM Assistant`.
 
 ## 8. External facts and how sure we are
 
-Network access in the authoring sessions allowed web search but blocked
-`ollama.com`, `huggingface.co`, `ai.google.dev` and `platform.openai.com`
-directly. Nothing below was checked against those sites.
+On 12 November 2026 the pages marked **official** below were read directly
+from the provider's own site. Everything else is from web search results,
+memory, or this repository's history. Google's Gemini documentation has moved
+to `aistudio.google.com`, which was not reachable, so Gemini facts are
+unchecked.
 
-| Claim | Confidence | Basis | To verify |
-|---|---|---|---|
-| Claude model IDs, prices, cache pricing (1.25× / 2× / 0.1×), 512-token cache minimum, Haiku's 100K price band and ~30% tokenizer difference | High, as of 2026-10-06 | Anthropic's bundled API reference with that date | `GET /v1/models`; the pricing page. Newer models may exist. |
-| Anthropic terms forbid subscription use in third-party tools | High | Fetched from anthropic.com | — |
-| Transformers.js does not load in Zotero | Medium-high | Commit `d3acbf6` records the observed errors; no `.wasm` files in the XPI | §7 step 2 |
-| `qwen3.5:4b` ≈ 3.4 GB, ~6 GB RAM, 256K context | Medium-high | Several agreeing secondary sources | `ollama show qwen3.5:4b` |
-| Ollama `/api/embed`; `all-minilm`, `nomic-embed-text`, `embeddinggemma` | Medium-high | Ollama's documentation surfaced by search; sizes from blogs | Ollama docs; `ollama pull` |
-| "Sign in with ChatGPT" is live and needs per-app approval for plan usage | Medium | OpenAI help-centre and developer-page snippets via search | `developers.openai.com/siwc/quickstart` |
-| Zotero MCP servers exist and work with the Claude desktop app | Medium | Project listings via search | The project's README |
-| OpenAI and Gemini usage field names in D9 | Medium-low | Memory of the APIs | A live response |
-| Local speed figures in §5.5 | Low | Rough expectation | Measure |
-| Exact current OpenAI and Gemini model IDs and prices | Low | Aggregators that disagree | Live `/v1/models`; official pricing |
+| Claim | Confidence | Basis |
+|---|---|---|
+| `qwen3.5:4b` is 3.3–4.0 GB with 256K context; bare `qwen3.5` is the 9B | High | **Official:** Ollama library page |
+| `all-minilm` 46 MB, `nomic-embed-text` 274 MB, `embeddinggemma` 622 MB | High | **Official:** Ollama library pages |
+| Ollama `/api/embed`; `options.num_ctx`; `keep_alive` (5-minute default); `think`; `prompt_eval_count` / `eval_count`; `capabilities` and `context_length` from `/api/show`; 4K default context under 24 GB | High | **Official:** Ollama documentation |
+| Pinned MiniLM revision is the repository head; an ONNX EmbeddingGemma build exists | High | **Official:** Hugging Face API |
+| OpenAI chat models and prices in §5.1; cache-write pricing; `cached_tokens` usage field | High | **Official:** OpenAI pricing and prompt-caching pages |
+| ChatGPT plan usage is open to open-source, locally hosted apps; the flow in §5.4 | High that it is documented; **untested** | **Official:** OpenAI developer documentation. Preview feature; may change. |
+| Claude model IDs, prices, cache pricing (1.25× / 2× / 0.1×), 512-token cache minimum, Haiku's 100K price band and ~30% tokenizer difference | High, as of 2026-10-06 | Anthropic's bundled API reference with that date. Newer models may exist; check `GET /v1/models`. |
+| Anthropic terms forbid subscription use in third-party tools | High | **Official:** anthropic.com consumer terms (read October 2026) |
+| Transformers.js does not load in Zotero | Medium-high | Commit `d3acbf6` records the observed errors; no `.wasm` files in the XPI. Confirm with §7 step 2. |
+| Zotero's local HTTP server can host the OAuth callback | **Unknown** | Not checked. First task of M4. |
+| Zotero MCP servers work with the Claude desktop app | Medium | Project listings via search |
+| Chat Completions and Gemini usage field names in D9 | Medium-low | Memory |
+| Local speed figures in §5.5 | Low | Rough expectation; measure |
+| Current Gemini model IDs, prices and caching behaviour | Low | Aggregators that disagree |
 
 ---
 
@@ -595,7 +712,7 @@ directly. Nothing below was checked against those sites.
 | Question-dependent chunk selection in retrieval mode | **Reversed** in favour of core plus supplement (§5.2). |
 | Fix truncation by windowing instead of swapping the embedding model | Kept, but it matters only once a real embedding backend runs. |
 | Semantic retrieval through Transformers.js inside Zotero | **Reversed** in favour of Ollama embeddings and catalog mode (§5.3). |
-| Subscription login | Not for Claude. ChatGPT only if approved. Try the MCP route first. |
+| Subscription login | Not for Claude (MCP route instead). ChatGPT: **now feasible** through the open-source plan-usage flow (M4). |
 | Footer shows token counts, no dollar estimate | Kept. |
 
 ### Questions for the owner
@@ -607,8 +724,10 @@ directly. Nothing below was checked against those sites.
 4. Which providers will you actually use? That sets testing priority.
 5. Is sending the full list of titles and authors to a cloud provider
    acceptable, with private items excluded?
-6. Would using the Claude desktop app with a Zotero connector satisfy the
-   subscription goal, or does it have to be inside Zotero?
+6. Do you have a ChatGPT Plus or Pro plan you would want to use from the
+   plugin? If so, M4 can move ahead of M3.
+7. For Claude, would using the Claude desktop app with a Zotero connector
+   satisfy the subscription goal, or does it have to be inside Zotero?
 
 ---
 
@@ -616,8 +735,15 @@ directly. Nothing below was checked against those sites.
 
 - A cloud session cannot run Zotero. It can change code, run the unit tests and
   build the XPI; runtime results must come from the owner.
-- To check external facts from a cloud session, the environment's network
-  settings must allow the sites in §8.
+- A cloud environment named `zotero-llm-assistant` now exists for this
+  repository. Start the next session in it. It allows `ollama.com`,
+  `docs.ollama.com`, `huggingface.co`, `platform.openai.com`,
+  `developers.openai.com` and `ai.google.dev`, and installs dependencies at
+  start-up with `npm ci`. That start-up script has not yet run in a fresh
+  session. To read Gemini's documentation, `aistudio.google.com` still needs
+  adding.
+- Live API checks need a key for the provider's API host, entered through the
+  session's credential form, never pasted into chat.
 - `CLAUDE.md`, `AGENT.md` and `ROADMAP.md` are deliberately untracked in this
   repository; this file is the shared plan.
 - Unit tests are standalone `tsx` scripts using Node's `assert`; follow the
@@ -630,18 +756,34 @@ directly. Nothing below was checked against those sites.
 
 ### Sources
 
-Anthropic [consumer terms](https://www.anthropic.com/legal/consumer-terms);
-Claude models, pricing and caching from Anthropic's bundled API reference
-(dated 2026-10-06).
+Read directly on 12 November 2026:
+[Ollama: qwen3.5 tags](https://ollama.com/library/qwen3.5/tags) ·
+[Ollama: embeddinggemma](https://ollama.com/library/embeddinggemma) ·
+[Ollama: all-minilm](https://ollama.com/library/all-minilm) ·
+[Ollama: nomic-embed-text](https://ollama.com/library/nomic-embed-text) ·
+[Ollama embeddings guide](https://docs.ollama.com/capabilities/embeddings.md) ·
+[Ollama chat API](https://docs.ollama.com/api/chat.md) ·
+[Ollama thinking](https://docs.ollama.com/capabilities/thinking.md) ·
+[Ollama show model details](https://docs.ollama.com/api-reference/show-model-details.md) ·
+[Ollama context length](https://docs.ollama.com/context-length.md) ·
+[Hugging Face: EmbeddingGemma ONNX](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) ·
+[Hugging Face: all-MiniLM-L6-v2](https://huggingface.co/Xenova/all-MiniLM-L6-v2) ·
+[OpenAI pricing](https://developers.openai.com/api/docs/pricing) ·
+[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) ·
+[Sign in with ChatGPT: quickstart](https://developers.openai.com/siwc/quickstart) ·
+[ChatGPT plan usage for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source) ·
+[sign-in flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in) ·
+[models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference) ·
+[preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) ·
+[token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference)
 
-Secondary, via web search: 
-[Ollama embeddings documentation](https://docs.ollama.com/capabilities/embeddings.md) ·
-[Ollama embedding model comparison](https://www.morphllm.com/ollama-embedding-models) ·
-[Qwen3.5 small models guide](https://insiderllm.com/guides/qwen-3-5-small-models-9b-beats-30b/) ·
-[Qwen3.5-4B model page](https://huggingface.co/Qwen/Qwen3.5-4B) ·
-[Qwen3.5 small models analysis](https://artificialanalysis.ai/articles/qwen3-5-small-models) ·
+Read in October 2026: Anthropic
+[consumer terms](https://www.anthropic.com/legal/consumer-terms). Claude
+models, pricing and caching are from Anthropic's bundled API reference dated
+2026-10-06.
+
+Via web search, not checked at the source:
 [zotero-mcp](https://github.com/kujenga/zotero-mcp) ·
-[Sign in with ChatGPT quickstart](https://developers.openai.com/siwc/quickstart) ·
 [OpenAI help: Sign in with ChatGPT](https://help.openai.com/en/articles/20001542) ·
-[Sign in with ChatGPT partner launch](https://itbrief.co.uk/story/openai-launches-chatgpt-sign-in-for-16-partner-tools) ·
+[Qwen3.5 small models analysis](https://artificialanalysis.ai/articles/qwen3-5-small-models) ·
 [Anthropic OAuth reporting](https://winbuzzer.com/2026/02/19/anthropic-bans-claude-subscription-oauth-in-third-party-apps-xcxwbn/)
