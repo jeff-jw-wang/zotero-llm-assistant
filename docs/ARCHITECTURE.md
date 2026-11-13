@@ -149,16 +149,17 @@ appendMessage(itemId, { role, content, sourceChunks })   IndexedDB
 | `src/addon.ts` | `Addon` class holding runtime data (config, ztoolkit, initialized flag) |
 | `src/hooks.ts` | Zotero lifecycle events (startup, shutdown, window load/unload, prefs) |
 | `src/prefs.ts` | All `Zotero.Prefs` reads/writes; single source of truth for setting keys |
-| `src/utils/tokens.ts` | Token estimation (4 chars ≈ 1 token); model-specific caps |
+| `src/utils/tokens.ts` | Token estimation (4 chars ≈ 1 token); topK derivation |
 | `src/utils/url.ts` | SSRF validator for custom endpoints |
 | `src/utils/locale.ts` | FTL localization helpers |
 | `src/modules/llm/types.ts` | `ILLMProvider`, `LLMMessage`, `StreamChunk`, `ChatOptions` interfaces |
-| `src/modules/llm/client.ts` | Provider factory; privacy enforcement; message builder; system prompt |
+| `src/modules/llm/models.ts` | Model discovery + context-window/input-budget resolution |
+| `src/modules/llm/client.ts` | Provider factory; model resolution; privacy enforcement; message builder; system prompt |
 | `src/modules/llm/providers/ollama.ts` | Ollama (local, ndjson streaming) |
 | `src/modules/llm/providers/gemini.ts` | Google Gemini (SSE streaming) |
 | `src/modules/rag/extractor.ts` | PDF text extraction via Zotero.FullText; page splitting; attachment key |
 | `src/modules/rag/chunker.ts` | Paragraph/window text chunking; FNV-1a content-hashed IDs; chunk ID regex |
-| `src/modules/rag/pipeline.ts` | RAG orchestrator: extract → chunk → score → select → build prompt; per-item cache |
+| `src/modules/rag/pipeline.ts` | Context orchestrator: whole-paper mode when the text fits the budget, else chunk-RAG; per-item cache |
 | `src/modules/storage/db.ts` | IndexedDB: conversations, privacy flags, embeddings (Phase D) |
 | `src/modules/ui/readerPanel.ts` | Panel registration + full chat UI wiring; citation parsing; history rendering |
 | `src/modules/ui/onboarding.ts` | First-run consent modal |
@@ -210,6 +211,58 @@ legacy `[p.N]` regex for styled (non-clickable) display.
 
 ---
 
+## Library Retrieval
+
+Library questions send **metadata only** — title, authors, year, abstract and a
+`zotero://` link per match. Full texts are never sent on this path.
+
+Retrieval is hybrid. Keyword and semantic ranking run **independently over the
+whole library**, then fuse by Reciprocal Rank Fusion:
+
+```
+score(item) = Σ over lists  1 / (60 + rank_in_that_list)
+```
+
+This replaced a design where keyword score was a *gate*: only items with
+`score > 0` entered a shortlist, and semantic similarity merely re-ranked those
+survivors. An item sharing no literal word with the query was therefore
+eliminated before embeddings were consulted — so conceptual questions, the
+whole reason the feature exists, returned little. Keyword matching is now a
+contributor, not a filter.
+
+RRF is used rather than a weighted sum because keyword scores (unbounded
+integers) and cosine similarities (−1..1) are on incomparable scales, while
+ranks are comparable by construction.
+
+Semantic coverage grows in the background (`startBackgroundEmbedding`), so a
+fresh library starts keyword-only and improves as indexing proceeds;
+`SearchDiagnostics.semanticCovered` reports progress.
+
+**Known limitation.** The "semantic" ranking is only as good as the embedding
+backend. Inside Zotero the Transformers.js backend has been observed to fail
+(commit `d3acbf6`), in which case `HashingRunner` supplies word-and-trigram
+hash vectors — a lexical signal, not a semantic one. Until a real embedding
+backend runs, fusion combines two lexical rankings. See
+`docs/MODERNIZATION_PLAN_2026.md` §3 and §5.3.
+
+### Embedding method versioning
+
+Vectors are comparable only within one embedding *method*. `EMBEDDING_METHOD_VERSION`
+in `embedder.ts` is bumped whenever the text→vector transformation changes, and
+the cache is cleared and rebuilt — mixing methods in one cosine ranking
+degrades retrieval silently. Method v2 windows long inputs and mean-pools them,
+fixing a bug where chunks (~512 tokens) were silently truncated to the model's
+256-token limit, so roughly half of every chunk never reached the encoder.
+
+### Answer grounding
+
+The model is instructed to keep metadata-grounded claims separate from claims
+it recalls about papers it recognises, using a fixed section heading. The UI
+renders the recalled section in a distinct block labelled "not verified against
+your library". A missing heading degrades safely — the text renders as grounded,
+as it did before the contract existed. `zotero://` links stay whitelisted to
+keys actually sent, in both sections.
+
 ## Privacy Model
 
 Default state: **paper content is never sent to cloud APIs**.
@@ -229,6 +282,47 @@ checkPrivacy(provider, itemId):
 ```
 
 ---
+
+## Prompt Caching and Context Modes
+
+The plugin picks one of two context modes per request, in `pipeline.ts`:
+
+| | whole-paper | chunk-rag |
+|---|---|---|
+| When | full text + overhead fits the input budget | it does not |
+| Document block | entire paper, page-marked `[p.N]` | selected chunks, `[c.ID pp.X-Y]` |
+| Stable across turns? | **yes** — question-independent | no — selection depends on the question |
+| Citations | `[p.N]`, validated against page count | `[c.ID]`, validated against the chunk whitelist |
+
+Whole-paper mode exists because the previous design could never hit a prompt
+cache. Chunk scoring depends on the question, so the document block changed
+every turn, so the cacheable prefix changed every turn, and every question
+re-paid full input price for its context. Making the document block
+question-independent is what unlocks caching.
+
+Message order is therefore stable-first:
+
+```
+[system]     guardrails + citation scheme    ─┐ cache breakpoint
+[user]       <document> … paper text …       ─┘ cache breakpoint
+[assistant]  fixed acknowledgement
+[history]    grows each turn
+[user]       the current question              volatile
+```
+
+`LLMMessage.cacheable` marks a breakpoint. Providers interpret it differently:
+
+| Provider | Mechanism |
+|---|---|
+| Anthropic | explicit `cache_control: {type: "ephemeral", ttl: "1h"}`; reads ≈0.1x, writes ≈1.25x |
+| OpenAI | automatic prefix caching — no flag, just needs the prefix to be stable |
+| Gemini | implicit caching, on by default for 2.5+ models |
+| Ollama | no token cost, but llama.cpp reuses the KV cache, so follow-ups are faster |
+
+The diagnostics footer reports `cache N read / M written` when the provider
+supplies it. **If `read` stays at 0 across turns of one conversation, caching
+is not working** — something is invalidating the prefix. `test/caching.test.ts`
+guards the prefix-stability property directly.
 
 ## Citation Safety
 

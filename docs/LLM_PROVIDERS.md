@@ -129,6 +129,21 @@ export class MyProvider implements ILLMProvider {
 }
 ```
 
+### 1b. Model discovery (optional but preferred)
+
+Do **not** hardcode a default model ID. The plugin resolves models at runtime
+in `src/modules/llm/models.ts`, because hardcoded IDs went stale between
+releases and fed a hardcoded token-cap table that silently clamped unknown
+models to 8K.
+
+If your provider can list its models, add a branch to `listModels()`. Report
+`contextWindow` whenever the provider exposes it — that becomes the input
+budget via `resolveInputBudget()`. If it does not, add a family pattern to
+`FAMILY_WINDOWS` so inference has something better than the fallback.
+
+Then add your provider to `MODEL_PREFERENCE` in `client.ts` so "auto" mode can
+pick a sensible model when the user has not pinned one.
+
 ### 2. Add preference getters/setters
 
 In `src/prefs.ts`, add getter/setter functions for the provider's settings
@@ -190,7 +205,7 @@ Add corresponding entries in `getChatOptions()` and `autoDetectProvider()`.
 - **Type:** Cloud (`isCloud: true`)
 - **API:** Google Generative AI REST API with SSE streaming
 - **Auth:** API key (free with Google account)
-- **Default model:** `gemini-2.0-flash`
+- **Default model:** none pinned — resolved at runtime via model discovery
 - **Streaming:** Server-Sent Events — parse `data:` lines as JSON with
   `candidates[0].content.parts[0].text` deltas
 

@@ -11,6 +11,7 @@ declare namespace _ZoteroTypes {
       "llm.provider": string;
       "llm.ollama.endpoint": string;
       "llm.ollama.model": string;
+      "llm.ollama.numCtx": number;
       "llm.gemini.apiKey": string;
       "llm.gemini.model": string;
       "llm.openai.apiKey": string;
@@ -18,9 +19,13 @@ declare namespace _ZoteroTypes {
       "llm.openai.endpoint": string;
       "llm.anthropic.apiKey": string;
       "llm.anthropic.model": string;
+      "llm.anthropic.effort": string;
       "llm.custom.endpoint": string;
       "llm.custom.apiKey": string;
       "llm.custom.model": string;
+      "context.wholePaperMaxTokens": number;
+      "context.retrievedMaxTokens": number;
+      "embeddings.methodVersion": number;
       "onboarding.completed": boolean;
     };
   }

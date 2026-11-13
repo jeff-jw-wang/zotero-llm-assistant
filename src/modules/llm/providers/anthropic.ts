@@ -10,7 +10,8 @@
  * - System messages are extracted to a top-level `system` field
  * - `max_tokens` is required (not optional)
  * - Streaming uses SSE with typed events (content_block_delta / message_stop)
- * - Response body uses `content[0].text` (not `choices[0].message.content`)
+ * - Response body is a list of typed content blocks; the answer is the
+ *   `text` blocks, which may follow a `thinking` block
  *
  * @module modules/llm/providers/anthropic
  * @see https://docs.anthropic.com/en/api/messages
@@ -20,12 +21,35 @@ import type {
   LLMMessage,
   ChatOptions,
   StreamChunk,
+  TokenUsage,
 } from "../types";
-import { httpPost } from "../../../utils/http";
+import { clampMaxTokens } from "../types";
+import { httpGet, httpPost } from "../../../utils/http";
 
 const ENDPOINT = "https://api.anthropic.com/v1/messages";
+const MODELS_ENDPOINT = "https://api.anthropic.com/v1/models?limit=1";
 const API_VERSION = "2023-06-01";
-const DEFAULT_MAX_TOKENS = 4096;
+/**
+ * Default output cap for non-streaming requests.
+ *
+ * Was 4096, which truncated long answers mid-sentence. Current guidance is
+ * ~16K for non-streaming (keeps the response under HTTP timeouts) and ~64K
+ * for streaming, where timeouts are not a concern.
+ */
+const DEFAULT_MAX_TOKENS = 16_000;
+
+/** Default output cap for streaming requests. */
+const DEFAULT_STREAM_MAX_TOKENS = 64_000;
+
+/**
+ * Cache lifetime for the stable prompt prefix.
+ *
+ * A reading session runs over tens of minutes — well past the 5-minute
+ * default — so the longer TTL is what actually produces cache hits on turn 3
+ * and beyond. A 1h write costs more than a 5m write, but one extra write beats
+ * re-sending the whole paper at full price every few questions.
+ */
+const CACHE_TTL = "1h";
 
 /** Connection timeout (ms) for the initial fetch. */
 const CONNECTION_TIMEOUT_MS = 30_000;
@@ -33,28 +57,99 @@ const CONNECTION_TIMEOUT_MS = 30_000;
 /** Idle-read timeout (ms) — abort if no streaming data arrives for this long. */
 const IDLE_READ_TIMEOUT_MS = 60_000;
 
+/**
+ * Joins the text of a Messages API response, skipping every non-text block.
+ *
+ * `content` is a list of typed blocks, and the answer is not necessarily the
+ * first one: a model with thinking enabled (the default on Haiku 5.5) returns
+ * a `thinking` block first, which has no `text` field. Reading `content[0]`
+ * therefore returned an empty answer. Text can also be split across several
+ * `text` blocks.
+ *
+ * @param data - Parsed response body.
+ * @returns The concatenated text, or `""` when there is none.
+ */
+export function extractAnthropicText(data: any): string {
+  const blocks: unknown = data?.content;
+  if (!Array.isArray(blocks)) return "";
+  return blocks
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string)
+    .join("");
+}
+
 export class AnthropicProvider implements ILLMProvider {
   readonly name = "Anthropic";
   readonly isCloud = true;
 
   private apiKey: string;
 
+  /** Usage from the most recent non-streaming `chat()` call, if reported. */
+  private lastUsage: TokenUsage | undefined;
+
+  /** `stop_reason` from the most recent non-streaming `chat()` call. */
+  private lastStopReason: string | undefined;
+
   constructor(apiKey: string) {
     this.apiKey = apiKey;
+  }
+
+  /**
+   * Token accounting from the most recent non-streaming `chat()` call.
+   *
+   * Streaming reports usage on its chunks; `chat()` has no chunk to attach it
+   * to, so the non-stream fallback path reads it from here instead.
+   */
+  lastChatUsage(): TokenUsage | undefined {
+    return this.lastUsage;
+  }
+
+  /**
+   * Why the most recent non-streaming `chat()` call stopped (`end_turn`,
+   * `max_tokens`, `refusal`, …), for the same reason as {@link lastChatUsage}.
+   */
+  lastChatStopReason(): string | undefined {
+    return this.lastStopReason;
   }
 
   /**
    * Converts our LLMMessage[] to Anthropic's request format.
    * System messages are extracted to the top-level `system` field.
    * user/assistant messages go to the `messages` array (roles unchanged).
+   *
+   * Messages flagged `cacheable` get a `cache_control` breakpoint, which is
+   * why both `system` and message content are emitted as **arrays of content
+   * blocks** rather than bare strings — only the array form can carry it.
+   * The API allows at most 4 breakpoints per request; the message builder
+   * uses 2 (system + document).
+   *
+   * @param defaultMaxTokens - Output cap when the caller does not set one;
+   *   differs between streaming and non-streaming requests.
    */
-  private buildRequest(messages: LLMMessage[], options: ChatOptions) {
+  private buildRequest(
+    messages: LLMMessage[],
+    options: ChatOptions,
+    defaultMaxTokens: number = DEFAULT_MAX_TOKENS,
+  ) {
     const systemParts: string[] = [];
-    const apiMessages: Array<{ role: string; content: string }> = [];
+    let systemCacheable = false;
+    const apiMessages: Array<{ role: string; content: unknown }> = [];
 
     for (const msg of messages) {
       if (msg.role === "system") {
         systemParts.push(msg.content);
+        if (msg.cacheable) systemCacheable = true;
+      } else if (msg.cacheable) {
+        apiMessages.push({
+          role: msg.role,
+          content: [
+            {
+              type: "text",
+              text: msg.content,
+              cache_control: { type: "ephemeral", ttl: CACHE_TTL },
+            },
+          ],
+        });
       } else {
         apiMessages.push({ role: msg.role, content: msg.content });
       }
@@ -62,9 +157,26 @@ export class AnthropicProvider implements ILLMProvider {
 
     return {
       model: options.model,
-      max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-      ...(systemParts.length > 0 && { system: systemParts.join("\n\n") }),
+      // Clamped to the model's own limit: the defaults suit current models
+      // but exceed what an older pinned model accepts.
+      max_tokens: clampMaxTokens(
+        options.maxTokens ?? defaultMaxTokens,
+        options.modelMaxOutputTokens,
+      ),
+      ...(systemParts.length > 0 && {
+        system: [
+          {
+            type: "text",
+            text: systemParts.join("\n\n"),
+            ...(systemCacheable && {
+              cache_control: { type: "ephemeral", ttl: CACHE_TTL },
+            }),
+          },
+        ],
+      }),
       ...(options.temperature != null && { temperature: options.temperature }),
+      // Omitted unless the user opts in, so the model's own default applies.
+      ...(options.effort && { output_config: { effort: options.effort } }),
       messages: apiMessages,
     };
   }
@@ -83,7 +195,12 @@ export class AnthropicProvider implements ILLMProvider {
     }
 
     const data = res.json();
-    return data.content?.[0]?.text ?? "";
+    // Non-streaming has no chunk to carry usage on, so stash it for the
+    // caller to read via lastChatUsage(). Used by the non-stream fallback path.
+    this.lastUsage = this.parseUsage(data.usage);
+    this.lastStopReason =
+      typeof data?.stop_reason === "string" ? data.stop_reason : undefined;
+    return extractAnthropicText(data);
   }
 
   async *chatStream(
@@ -91,7 +208,7 @@ export class AnthropicProvider implements ILLMProvider {
     options: ChatOptions,
   ): AsyncGenerator<StreamChunk, void, unknown> {
     const body = {
-      ...this.buildRequest(messages, options),
+      ...this.buildRequest(messages, options, DEFAULT_STREAM_MAX_TOKENS),
       stream: true,
     };
 
@@ -127,6 +244,10 @@ export class AnthropicProvider implements ILLMProvider {
 
     const decoder = new TextDecoder();
     let buffer = "";
+    /** Accumulated token accounting; merged across message_start/_delta. */
+    let lastUsage: TokenUsage | undefined;
+    /** `stop_reason` from message_delta, reported on the final chunk. */
+    let stopReason: string | undefined;
 
     try {
       while (true) {
@@ -171,8 +292,36 @@ export class AnthropicProvider implements ILLMProvider {
 
           // Terminal: message_stop
           if (eventType === "message_stop") {
-            yield { text: "", done: true };
+            yield {
+              text: "",
+              done: true,
+              ...(lastUsage && { usage: lastUsage }),
+              ...(stopReason && { stopReason }),
+            };
             return;
+          }
+
+          // message_start carries input and cache token counts; message_delta
+          // carries the running output count. Merge rather than replace.
+          if (
+            (eventType === "message_start" || eventType === "message_delta") &&
+            dataStr
+          ) {
+            try {
+              const data = JSON.parse(dataStr) as any;
+              if (typeof data.delta?.stop_reason === "string") {
+                stopReason = data.delta.stop_reason;
+              }
+              const usage = this.parseUsage(
+                data.message?.usage ?? data.usage,
+              );
+              if (usage) {
+                lastUsage = { ...(lastUsage ?? {}), ...usage };
+                yield { text: "", done: false, usage: lastUsage };
+              }
+            } catch {
+              // Skip malformed SSE events.
+            }
           }
 
           // Content delta
@@ -191,28 +340,53 @@ export class AnthropicProvider implements ILLMProvider {
       }
 
       // Signal completion if stream ended without message_stop.
-      yield { text: "", done: true };
+      yield {
+        text: "",
+        done: true,
+        ...(lastUsage && { usage: lastUsage }),
+        ...(stopReason && { stopReason }),
+      };
     } finally {
       controller.abort();
       try { reader.releaseLock(); } catch { /* ignore */ }
     }
   }
 
+  /**
+   * Extracts token accounting from an Anthropic `usage` object.
+   *
+   * `cache_read_input_tokens` is the signal that matters: if it stays zero
+   * across turns of one conversation, the cached prefix is being invalidated
+   * somewhere and the caching work is not paying off.
+   */
+  private parseUsage(usage: any): TokenUsage | undefined {
+    if (!usage || typeof usage !== "object") return undefined;
+
+    const out: TokenUsage = {};
+    if (typeof usage.input_tokens === "number")
+      out.inputTokens = usage.input_tokens;
+    if (typeof usage.output_tokens === "number")
+      out.outputTokens = usage.output_tokens;
+    if (typeof usage.cache_read_input_tokens === "number")
+      out.cacheReadTokens = usage.cache_read_input_tokens;
+    if (typeof usage.cache_creation_input_tokens === "number")
+      out.cacheWriteTokens = usage.cache_creation_input_tokens;
+
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   async isAvailable(): Promise<boolean> {
     if (!this.apiKey) return false;
     try {
-      // Send a minimal request to verify the API key is valid.
-      // A 400 (bad request) still means the API is reachable and the key works.
-      const res = await httpPost(ENDPOINT, JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1,
-        messages: [{ role: "user", content: "ping" }],
-      }), {
-        "Content-Type": "application/json",
+      // Probe /v1/models rather than sending a Messages request. A Messages
+      // ping has to name a model, which means hardcoding one that goes stale
+      // and then fails for a reason unrelated to the key. Listing models is
+      // model-agnostic, free, and verifies reachability and the key at once.
+      const res = await httpGet(MODELS_ENDPOINT, {
         "x-api-key": this.apiKey,
         "anthropic-version": API_VERSION,
       }, 5000);
-      return res.ok || res.status === 400;
+      return res.ok;
     } catch {
       return false;
     }

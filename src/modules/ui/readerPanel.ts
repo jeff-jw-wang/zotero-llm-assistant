@@ -39,11 +39,17 @@ import {
   type ChunkMeta,
 } from "../rag/pipeline";
 import { makeChunkCiteRegex, CHUNK_ID_PATTERN } from "../rag/chunker";
+import type { TokenUsage } from "../llm/types";
+import type { ContextMode } from "../llm/client";
 import {
   createProvider,
   checkPrivacy,
-  getChatOptions,
+  getPromptPlan,
+  resolveChatOptions,
 } from "../llm/client";
+import type { PipelineResult } from "../rag/pipeline";
+import { describeSelection, describeDroppedHistory } from "../rag/notes";
+import { consumeChatStream, describeStop } from "../llm/stream";
 import { OllamaProvider } from "../llm/providers/ollama";
 import {
   appendMessage as dbAppendMessage,
@@ -285,7 +291,14 @@ function renderChatUI(
               });
             }
           }
-          renderResponseWithCitations(bubble, doc, msg.content, whitelist, item);
+          renderResponseWithCitations(
+            bubble,
+            doc,
+            msg.content,
+            whitelist,
+            item,
+            msg.pageCount,
+          );
           appendCopyButton(bubble, doc, () => msg.content);
         } else {
           appendBubble(messages, doc, "user", msg.content);
@@ -413,11 +426,38 @@ async function handleQuestion(
 
   // --- Build RAG context via pipeline ---
   const statusNote = appendStatusNote(messages, doc, "Extracting and analysing paper\u2026", scrollState.stick);
-  const options = getChatOptions();
+
+  // Resolve the model and the prompt plan (how much document, and how much
+  // prompt in total, this model and these settings allow). Both come from
+  // provider discovery, so an unpinned model and an unknown window both work.
+  let options;
+  let plan;
+  try {
+    // Both read the same cached discovery result.
+    const [resolvedOptions, resolvedPlan] = await Promise.all([
+      resolveChatOptions(),
+      getPromptPlan(),
+    ]);
+    options = resolvedOptions;
+    plan = resolvedPlan.plan;
+  } catch (resolveErr: any) {
+    statusNote.remove();
+    appendBubble(
+      messages,
+      doc,
+      "assistant",
+      `⚠️ ${resolveErr?.message ?? String(resolveErr)}`,
+    );
+    return;
+  }
 
   let fullResponse = "";
-  let pipeline;
+  let pipeline: PipelineResult;
   let usedStream = true; // Flipped to false if streaming fails and we fall back to chat().
+  /** Token accounting reported by the provider, if any. */
+  let usage: TokenUsage | undefined;
+  /** Why the model stopped, where the provider reports it. */
+  let stopReason: string | undefined;
 
   try {
     // Build conversation history for the pipeline.
@@ -436,6 +476,8 @@ async function handleQuestion(
       history = (record?.messages ?? [])
         .filter((m) => m.role !== "system")
         .slice(0, -1) // exclude the just-saved current question
+        // An empty turn is not a turn: providers reject empty content.
+        .filter((m) => m.content.trim().length > 0)
         .slice(-MAX_CONTEXT_HISTORY_MESSAGES) // keep recent turns to preserve RAG context budget
         .map((m) => ({
           role: m.role as "user" | "assistant",
@@ -445,7 +487,7 @@ async function handleQuestion(
       ztoolkit.log("Failed to load conversation history:", dbErr?.message ?? dbErr);
     }
 
-    pipeline = await buildRAGContext(item, question, history, options.model);
+    pipeline = await buildRAGContext(item, question, history, plan);
 
     // Refresh sticky-scroll after the big async gap (PDF extraction + chunking
     // can take seconds). The user may have scrolled up during the wait.
@@ -460,7 +502,15 @@ async function handleQuestion(
         appendSystemNote(
           messages,
           doc,
-          `Paper: ${pipeline.stats.totalPages} pages, ${pipeline.stats.totalChunks} chunks. Showing ${pipeline.stats.selectedChunks} most relevant.`,
+          describeSelection(pipeline.stats),
+          scrollState.stick,
+        );
+      }
+      if (pipeline.stats.historyDropped > 0) {
+        appendSystemNote(
+          messages,
+          doc,
+          describeDroppedHistory(pipeline.stats.historyDropped),
           scrollState.stick,
         );
       }
@@ -485,27 +535,36 @@ async function handleQuestion(
     messages.appendChild(assistantBubble);
     scrollToBottom(messages, scrollState.stick);
 
+    // True until answer text has been shown; the status note stays up for as
+    // long as it is. A usage report or a thinking pause does not clear it.
     let firstChunk = true;
 
     try {
-      for await (const chunk of provider.chatStream(pipeline.messages, options)) {
-        if (firstChunk) {
-          removeStatusNote(statusNote);
-          firstChunk = false;
-        }
-        fullResponse += chunk.text;
-        // Re-check scroll position BEFORE DOM mutation (each chunk may change height).
-        scrollState.stick = isNearBottom(messages);
-        renderResponseWithCitations(
-          assistantBubble,
-          doc,
-          fullResponse,
-          pipeline.chunkWhitelist,
-          item,
-        );
-        scrollToBottom(messages, scrollState.stick);
-        if (chunk.done) break;
-      }
+      const streamed = await consumeChatStream(
+        provider.chatStream(pipeline.messages, options),
+        {
+          onFirstText: () => {
+            removeStatusNote(statusNote);
+            firstChunk = false;
+          },
+          onText: (text) => {
+            fullResponse = text;
+            // Re-check scroll position BEFORE DOM mutation (each chunk may change height).
+            scrollState.stick = isNearBottom(messages);
+            renderResponseWithCitations(
+              assistantBubble,
+              doc,
+              fullResponse,
+              pipeline.chunkWhitelist,
+              item,
+              pipeline.pageCount,
+            );
+            scrollToBottom(messages, scrollState.stick);
+          },
+        },
+      );
+      if (streamed.usage) usage = { ...(usage ?? {}), ...streamed.usage };
+      stopReason = streamed.stopReason;
     } catch (streamErr: any) {
       if (!shouldRetryNonStream(streamErr)) {
         throw streamErr;
@@ -523,6 +582,11 @@ async function handleQuestion(
         stream: false,
       });
       fullResponse = nonStreamText ?? "";
+      // chat() has no chunk to carry usage on; providers that track it expose
+      // it via lastChatUsage().
+      const reported = (provider as any).lastChatUsage?.();
+      if (reported) usage = { ...(usage ?? {}), ...reported };
+      stopReason = (provider as any).lastChatStopReason?.();
       scrollState.stick = isNearBottom(messages);
       renderResponseWithCitations(
         assistantBubble,
@@ -530,6 +594,7 @@ async function handleQuestion(
         fullResponse,
         pipeline.chunkWhitelist,
         item,
+        pipeline.pageCount,
       );
       scrollToBottom(messages, scrollState.stick);
       removeStatusNote(statusNote);
@@ -546,6 +611,14 @@ async function handleQuestion(
     // renderResponseWithCitations() does bubble.innerHTML="" on each call.
     if (fullResponse) {
       appendCopyButton(assistantBubble, doc, () => fullResponse);
+    }
+
+    // A refusal, a cut-off answer or no answer at all gets an explanation
+    // instead of a blank or silently truncated bubble.
+    const stopNote = describeStop(fullResponse, stopReason);
+    if (stopNote) {
+      if (!fullResponse.trim()) assistantBubble.remove();
+      appendSystemNote(messages, doc, `\u26a0 ${stopNote}`, scrollState.stick);
     }
   } catch (err) {
     // Clean up the status note before re-throwing — the caller renders the error.
@@ -567,28 +640,41 @@ async function handleQuestion(
       };
     });
 
-  // Fire-and-forget: persistence must never block UI completion.
-  void withTimeout(
-    dbAppendMessage(item.id, {
-      role: "assistant",
-      content: fullResponse,
-      timestamp: new Date().toISOString(),
-      sourceChunks: sourceChunks.length > 0 ? sourceChunks : undefined,
-    }),
-    DB_OP_TIMEOUT_MS,
-    "save assistant message",
-  ).catch((dbErr: any) => {
-    ztoolkit.log("Failed to save assistant message to DB:", dbErr?.message ?? dbErr);
-  });
+  // Fire-and-forget: persistence must never block UI completion. An empty
+  // answer is not saved: it would be replayed to the model as an empty
+  // assistant turn on the next question, which providers reject.
+  if (fullResponse.trim()) {
+    void withTimeout(
+      dbAppendMessage(item.id, {
+        role: "assistant",
+        content: fullResponse,
+        timestamp: new Date().toISOString(),
+        sourceChunks: sourceChunks.length > 0 ? sourceChunks : undefined,
+        // Recorded so history replay can validate [p.N] citations later.
+        pageCount: pipeline.pageCount,
+      }),
+      DB_OP_TIMEOUT_MS,
+      "save assistant message",
+    ).catch((dbErr: any) => {
+      ztoolkit.log("Failed to save assistant message to DB:", dbErr?.message ?? dbErr);
+    });
+  }
 
-  // D7: Diagnostics footer — model · host · mode · tokens.
+  // Diagnostics footer — model · host · transport · context mode · tokens,
+  // plus cache accounting when the provider reports it.
   const totalTokens =
     estimateTokens(pipeline.messages.map((m) => m.content).join("")) +
     estimateTokens(fullResponse);
   appendSystemNote(
     messages,
     doc,
-    buildDiagnosticsNote(options.model, usedStream, totalTokens),
+    buildDiagnosticsNote(
+      options.model,
+      usedStream,
+      totalTokens,
+      pipeline.mode,
+      usage,
+    ),
     scrollState.stick,
   );
 }
@@ -622,14 +708,23 @@ export function parseCitedChunkIds(text: string): string[] {
 }
 
 /**
- * Renders LLM response text into a bubble, converting citations:
+ * Renders LLM response text into a bubble, converting citations.
  *
- * Phase B (primary): [c.ID] chunk citations
+ * Chunk citations `[c.ID]` (chunk-rag mode):
  *   - ID in chunkWhitelist → clickable [pp.X-Y] link with excerpt tooltip
  *   - ID not in whitelist → struck-through text ("Citation not in source")
  *
- * Phase A (fallback): [p.N] page citations (legacy conversations)
- *   - Rendered as styled text, not clickable (no original whitelist available)
+ * Page citations `[p.N]` (whole-paper mode):
+ *   - `pageCount` given and 1 <= N <= pageCount → clickable [p.N] link
+ *   - `pageCount` given and N out of range → struck-through (hallucinated page)
+ *   - `pageCount` absent (legacy conversations) → styled text, not clickable
+ *
+ * The whitelist property is the same in both modes: the model can only produce
+ * a clickable citation to something that actually exists in the source. In
+ * whole-paper mode the page count is the whitelist, since the entire document
+ * was sent and every real page is therefore citable.
+ *
+ * @param pageCount - Total pages, for whole-paper mode page validation.
  */
 function renderResponseWithCitations(
   bubble: HTMLElement,
@@ -637,6 +732,7 @@ function renderResponseWithCitations(
   text: string,
   chunkWhitelist: Map<string, ChunkMeta>,
   item: Zotero.Item,
+  pageCount?: number,
 ): void {
   bubble.innerHTML = "";
 
@@ -689,14 +785,41 @@ function renderResponseWithCitations(
         bubble.appendChild(span);
       }
     } else if (match[2] !== undefined) {
-      // --- Legacy page citation [p.N] (Phase A backward compat) ---
+      // --- Page citation [p.N] ---
       const pageNum = parseInt(match[2], 10);
-      const span = h(doc,"span");
-      span.textContent = `[p.${pageNum}]`;
-      span.style.cssText =
-        "color:#7b9cc0;font-size:12px;cursor:default;";
-      span.title = "Legacy page citation";
-      bubble.appendChild(span);
+
+      if (pageCount !== undefined) {
+        if (pageNum >= 1 && pageNum <= pageCount) {
+          // Whole-paper mode: the page exists, so make it navigable.
+          const link = h(doc, "a") as HTMLAnchorElement;
+          link.href = "#";
+          link.textContent = `[p.${pageNum}]`;
+          link.style.cssText =
+            "color:#4a90d9;text-decoration:underline;cursor:pointer;";
+          link.title = `Open page ${pageNum}`;
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            openPDFAtPage(pageNum, item);
+          });
+          bubble.appendChild(link);
+        } else {
+          // Outside the document — same treatment as an unknown chunk ID.
+          const span = h(doc, "span");
+          span.textContent = `[p.${pageNum}]`;
+          span.style.cssText = "color:#bbb;text-decoration:line-through;";
+          span.title = `Page ${pageNum} is not in this document (${pageCount} pages)`;
+          bubble.appendChild(span);
+        }
+      } else {
+        // Legacy conversation: no page whitelist was recorded, so showing the
+        // marker as styled text is better than hiding it or faking a link.
+        const span = h(doc,"span");
+        span.textContent = `[p.${pageNum}]`;
+        span.style.cssText =
+          "color:#7b9cc0;font-size:12px;cursor:default;";
+        span.title = "Legacy page citation";
+        bubble.appendChild(span);
+      }
     }
 
     lastIndex = COMBINED_RE.lastIndex;
@@ -741,9 +864,12 @@ function openPDFAtPage(page: number, item: Zotero.Item): void {
       pdfItem = item;
     } else {
       const attachmentIDs: number[] = item.getAttachments();
+      // Zotero.Items.get() returns false for IDs it cannot resolve, so drop
+      // those before matching on attachmentContentType.
       pdfItem = attachmentIDs
         .map((id) => Zotero.Items.get(id))
-        .find((att) => att?.attachmentContentType === "application/pdf");
+        .filter((att): att is Zotero.Item => !!att)
+        .find((att) => att.attachmentContentType === "application/pdf");
     }
 
     if (pdfItem) {
@@ -1082,8 +1208,16 @@ function shouldRetryNonStream(err: any): boolean {
 /**
  * Builds the diagnostics footer string appended after each LLM response.
  *
- * Format: `{model} · {host} · {mode} · ~{tokens} tokens`
- * Example: `gpt-4o-mini · api.openai.com · stream · ~4,231 tokens`
+ * Format: `{model} · {host} · {transport} · {context mode} · {tokens}[ · cache …]`
+ * Example: `claude-haiku-5-5 · api.anthropic.com · stream · whole paper ·
+ *           ~11,204 tokens · cache 10,982 read / 0 written`
+ *
+ * Why exact token counts and no dollar estimate: prices change and a built-in
+ * price table is exactly the kind of hardcoded world-fact this release removed
+ * everywhere else. Token and cache counts come from the provider and stay
+ * correct. `cache read` is the number to watch — if it stays at 0 across turns
+ * of one conversation, something is invalidating the cached prefix and the
+ * paper is being re-billed at full price every question.
  *
  * Redaction rules (ROADMAP §diagnostics):
  *   - Only the hostname is shown — no path, no query parameters, no port.
@@ -1094,10 +1228,38 @@ function buildDiagnosticsNote(
   model: string,
   usedStream: boolean,
   tokens: number,
+  contextMode?: ContextMode,
+  usage?: TokenUsage,
 ): string {
   const host = getProviderDisplayHost();
-  const mode = usedStream ? "stream" : "non-stream";
-  return `${model} \u00b7 ${host} \u00b7 ${mode} \u00b7 ~${tokens.toLocaleString()} tokens`;
+  const transport = usedStream ? "stream" : "non-stream";
+
+  const parts = [model, host, transport];
+  if (contextMode) {
+    parts.push(contextMode === "whole-paper" ? "whole paper" : "selected chunks");
+  }
+
+  // Prefer provider-reported input tokens over our 4-chars-per-token estimate.
+  if (usage?.inputTokens !== undefined || usage?.outputTokens !== undefined) {
+    const inTok = usage.inputTokens ?? 0;
+    const outTok = usage.outputTokens ?? 0;
+    parts.push(`${inTok.toLocaleString()} in / ${outTok.toLocaleString()} out`);
+  } else {
+    parts.push(`~${tokens.toLocaleString()} tokens`);
+  }
+
+  if (
+    usage?.cacheReadTokens !== undefined ||
+    usage?.cacheWriteTokens !== undefined
+  ) {
+    const read = usage.cacheReadTokens ?? 0;
+    const written = usage.cacheWriteTokens ?? 0;
+    parts.push(
+      `cache ${read.toLocaleString()} read / ${written.toLocaleString()} written`,
+    );
+  }
+
+  return parts.join(" \u00b7 ");
 }
 
 /**

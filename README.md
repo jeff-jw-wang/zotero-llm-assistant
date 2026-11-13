@@ -5,12 +5,15 @@ AI-powered research assistant for Zotero — chat with papers, search your libra
 ## Features
 
 - **Chat with papers** — Ask questions about any PDF open in the reader; get streaming answers grounded in the document
-- **Chunk-based RAG** — Papers are split into semantically meaningful chunks (~512 tokens); only the most relevant chunks are sent to the LLM
-- **Clickable citations** — The LLM cites chunk IDs that resolve to page links; click to jump directly to the source page in the PDF
-- **Library search** — Search your entire Zotero library by metadata (title, authors, tags, abstract) and ask questions across papers
+- **Cached whole-paper context** — When a paper fits the model's context budget, the full text is sent once and cached (Anthropic), so follow-up questions read it at about a tenth of the normal input price instead of paying full price every turn. Large documents fall back to chunk-based retrieval automatically
+- **Clickable citations** — Answers cite page numbers (or chunk IDs in retrieval mode); click to jump straight to the source page. Citations are validated against the source, so a page or chunk that was never sent is struck through rather than linked
+- **Library search** — Ask questions across your whole library ("which papers address this research question?"). Keyword and embedding rankings run independently over every item and are combined by rank fusion. Only metadata is sent, never full papers. Note: inside Zotero the embedding ranking currently falls back to a lexical hashing method, so matching by meaning is limited — see the modernization plan
+- **Separated recall** — When the model adds detail it remembers about a paper rather than reading it from your metadata, that goes in a visually distinct "not verified against your library" block
 - **Multi-provider LLM support** — Ollama (local, default), Google Gemini, OpenAI, Anthropic, or any OpenAI-compatible endpoint
+- **Automatic model discovery** — model names and context windows are read from the provider at runtime, so defaults don't go stale between releases. Leave the model field empty for "use the best available"
 - **Privacy-first** — Cloud sharing is OFF by default; per-item privacy flags let you protect sensitive papers from being sent to cloud APIs
 - **Conversation history** — Stored locally in IndexedDB; conversations are per-paper and persist across sessions
+- **Cost transparency** — Each answer reports exact input/output tokens and how many were served from cache, straight from the provider
 
 ## Requirements
 
@@ -30,14 +33,15 @@ AI-powered research assistant for Zotero — chat with papers, search your libra
 ## Quick Start
 
 1. **Configure a provider** — Go to `Zotero → Settings → LLM Assistant` and select a provider:
-   - **Ollama** (default): Install [Ollama](https://ollama.com/), pull a model (`ollama pull llama3.2`), and the plugin auto-detects it at `localhost:11434`
+   - **Ollama** (default): Install [Ollama](https://ollama.com/), pull a model (`ollama pull qwen3.5:4b` is a good fit for an 8 GB machine), and the plugin auto-detects it at `localhost:11434`
    - **Gemini**: Enter your [Google AI Studio](https://aistudio.google.com/apikey) API key
    - **OpenAI**: Enter your OpenAI API key
    - **Anthropic**: Enter your Anthropic API key
    - **Custom**: Enter any OpenAI-compatible endpoint URL and API key
-2. **Open a paper** — Double-click any PDF in your library to open the reader
-3. **Open the chat panel** — Click the LLM Assistant icon in the reader sidebar
-4. **Ask a question** — Type a question and press Enter
+2. **Pick a model** (optional) — Leave the Model field empty to auto-select the best available one, or press **Detect** to see what the provider offers and pin a specific model
+3. **Open a paper** — Double-click any PDF in your library to open the reader
+4. **Open the chat panel** — Click the LLM Assistant icon in the reader sidebar
+5. **Ask a question** — Type a question and press Enter
 
 ## Building from Source
 
@@ -111,6 +115,7 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model.
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — System design, data flow, module map
+- [Modernization plan](docs/MODERNIZATION_PLAN_2026.md) — Current state of the 0.2–0.4 work, known defects, and next steps. **Read before installing a build from this branch**
 - [Development](docs/DEVELOPMENT.md) — Dev setup, build system, testing
 - [Security](docs/SECURITY.md) — Threat model, SSRF policy, prompt injection defense
 - [Zotero API](docs/ZOTERO_API.md) — Spike outcomes, undocumented APIs used

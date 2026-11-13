@@ -2,6 +2,12 @@ pref-title = LLM Assistant Settings
 pref-provider-label = LLM Provider
 pref-api-key-label = API Key
 pref-model-label = Model
+pref-detect-models =
+    .label = Detect
+pref-ollama-numctx-label = Context size
+pref-ollama-numctx-hint = Tokens of context to give the local model (num_ctx). This is limited by your RAM, not by what the model advertises — lower it if Ollama starts swapping. 16384 suits an 8 GB machine; raise it if you have more.
+pref-effort-label = Effort
+pref-effort-hint = Reasoning effort. Lower is cheaper and faster; grounded questions about a paper rarely need more than Low or Medium.
 pref-endpoint-label = Endpoint URL
 
 pref-ollama-hint = Ollama runs locally — no data leaves your machine. Install from ollama.com.
@@ -17,10 +23,15 @@ pref-custom-warning = ⚠ This endpoint will receive your paper content and API 
 
 pref-api-key-warning = API keys are stored as plaintext in your Zotero profile. Not suitable for shared machines.
 
+pref-context-label = Context size
+pref-whole-paper-max-label = Largest paper sent whole (tokens)
+pref-retrieved-max-label = Most text sent from a larger paper (tokens)
+pref-context-hint = 0 means automatic: about 60,000 and 24,000 tokens for cloud models, and 40% of the Ollama context size for local ones. A paper under the first limit is sent in full; a longer one is answered from its most relevant sections, up to the second limit. Lower values cost less and answer faster. A token is roughly four characters.
+
 pref-semantic-label = Semantic Search
 pref-semantic-toggle =
     .label = Enable semantic search (embedding-based)
-pref-semantic-note = Downloads a ~25 MB model from HuggingFace on first use. Improves search quality by understanding meaning, not just keywords. Runs entirely on your machine.
+pref-semantic-note = Ranks results by similarity as well as by keywords. On first use this tries to load a small embedding model (~25 MB, from Hugging Face). If that model cannot load inside Zotero, a simpler built-in match on shared words and spelling is used instead, which does not understand meaning. Either way it runs entirely on your machine.
 
 pref-privacy-label = Privacy
 pref-cloud-sharing =

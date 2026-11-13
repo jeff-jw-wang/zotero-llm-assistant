@@ -14,7 +14,12 @@
  */
 
 import assert from "node:assert/strict";
-import { scoreItem, buildLLMContext, parseLibraryLinks } from "../src/modules/library/searcher";
+import {
+  scoreItem,
+  buildLLMContext,
+  parseLibraryLinks,
+  MAX_ABSTRACT_CHARS,
+} from "../src/modules/library/searcher";
 import type { SearchResult } from "../src/modules/library/searcher";
 import type { ItemMetadata } from "../src/modules/library/indexer";
 
@@ -167,17 +172,25 @@ test("single result → correct fields emitted", () => {
   assert.ok(ctx.includes("Link: zotero://select/library/items/XYZ789"));
 });
 
-test("abstract truncated at 300 chars with ...", () => {
-  const longAbstract = "A".repeat(350);
+test("abstract truncated at MAX_ABSTRACT_CHARS with ...", () => {
+  const longAbstract = "A".repeat(MAX_ABSTRACT_CHARS + 50);
   const result = makeResult({ abstract: longAbstract });
   const ctx = buildLLMContext([result]);
-  // Should contain first 300 chars + "..."
-  assert.ok(ctx.includes("A".repeat(300) + "..."));
-  assert.ok(!ctx.includes("A".repeat(301)));
+  assert.ok(ctx.includes("A".repeat(MAX_ABSTRACT_CHARS) + "..."));
+  assert.ok(!ctx.includes("A".repeat(MAX_ABSTRACT_CHARS + 1)));
+});
+
+test("a realistic full abstract is NOT truncated", () => {
+  // The old 300-char limit cut most real abstracts off mid-sentence.
+  const realistic = "We study X. ".repeat(60); // ~720 chars
+  assert.ok(realistic.length > 300 && realistic.length < MAX_ABSTRACT_CHARS);
+  const ctx = buildLLMContext([makeResult({ abstract: realistic })]);
+  assert.ok(ctx.includes(`Abstract: ${realistic}`));
+  assert.ok(!ctx.includes("..."));
 });
 
 test("short abstract is NOT truncated", () => {
-  const shortAbstract = "Short abstract under 300 chars.";
+  const shortAbstract = "Short abstract under the limit.";
   const result = makeResult({ abstract: shortAbstract });
   const ctx = buildLLMContext([result]);
   assert.ok(ctx.includes(`Abstract: ${shortAbstract}`));
