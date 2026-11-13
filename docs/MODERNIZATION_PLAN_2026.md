@@ -796,8 +796,101 @@ and search for `Zotero LLM Assistant`.
 
 ### 7.1 Results
 
-Not yet run. Record here, per step: what happened, the Zotero version, the
-operating system and machine, and any lines from the debug output.
+**Partly run, 12 November 2026**, by a Claude Code session on the owner's
+Mac using computer use. Ollama was not installed and no API key was entered,
+so every step that needs a model was **skipped**. Nothing below is inferred:
+a step not listed as observed was not observed.
+
+**Setup**
+
+- Zotero 10.0.9 (app bundle, `Zotero.version` and the `X-Zotero-Version`
+  header), macOS 26.4
+  (25E246), Mac16,10, Apple M4, 16 GB.
+- Branch at `e69a2c3`. `npm ci`, `npm test` (316 passed, 0 failed; the count
+  in §1 is 304 and is now out of date), `npx tsc --noEmit` (clean) and
+  `npm run build` all succeeded with Node 22.23.5. The build warns
+  `Cannot find base config file "zotero-types/entries/sandbox/" [tsconfig.json]`
+  but finishes. The XPI's `manifest.json` says `0.5.0-beta.1`.
+- In Zotero 10 the menu is **Tools → Plugins**, gear → **Install Plugin From
+  File…** (not "Add-ons"). The plugin installed and enabled with no error.
+- The library was empty. Five arXiv papers were added with Add Item by
+  Identifier, PDFs attached: 1706.03762 (Attention), 1810.04805 (BERT),
+  1512.03385 (ResNet), 2001.08361 (Scaling Laws), 2005.14165 (GPT-3, 75
+  pages).
+- Debug output logging was enabled before install. Debug lines below are
+  quoted without the `[Zotero LLM Assistant]` prefix line that precedes each.
+  At start-up the plugin logged `Locale initialized`, `Library indexer
+  notifier registered`, `LLM Assistant panel init for item: undefined` and
+  `Library panel init`.
+
+**Per step**
+
+1. **Observed, passes, with notes.** The pane renders and the footer reads
+   `Zotero LLM Assistant v0.5.0-beta.1 — built 2026-11-12 16:56:21`. Ollama,
+   Google Gemini, OpenAI and Anthropic each show a labelled **Detect** button.
+   Custom Endpoint has no Detect button (endpoint URL, key and model only).
+   The provider dropdown still labels OpenAI **"OpenAI (GPT-4o-mini)"**, which
+   is stale after M1. The Anthropic model field is pre-filled `claude-haiku-5-5`
+   with Effort "Model default". Opening the pane logs `Preferences pane
+   loaded` and sends `HTTP GET http://localhost:11434/api/tags`.
+2. **Observed: hashing fallback, and a second defect.** Ticking "Enable
+   semantic search" showed "Model not downloaded" and a Download Model
+   button. After pressing it the pane showed **"✓ Model ready"**, but the
+   Config Editor read `embeddings.modelRevision = local-hash-v1`,
+   `modelAccepted = true`, `runtimeUnsupported = false`,
+   `runtimeUnsupportedReason` empty, `methodVersion = 0`. So the UI reports
+   success while the real model is not in use. Debug output:
+   ```
+   Embedder: installed console shim for Transformers.js
+   [TF.js] dtype not specified for "model". Using the default dtype (q8) for this device (wasm).
+   [TF.js] Unable to determine content-length from response headers. Will expand buffer when needed.
+   Embedder: Transformers unavailable (no available backend found. ERR: [wasm] Error: Dynamic require of "node:os" is not supported). Falling back to hashing backend.
+   Embedder: using hashing fallback backend
+   Embeddings: method migration failed, will retry: IndexedDB is not available in this context.
+   ```
+   The last line is a separate problem: the embedding cache cannot open
+   IndexedDB where the plugin runs, so `methodVersion` stays 0 (see step 7).
+   The values were unchanged after the step 7 searches.
+3. **Skipped:** Ollama not installed (nothing on port 11434, no `ollama`
+   CLI). The Ollama section showed, in red, "Ollama not detected at
+   http://localhost:11434…", with Check Ollama and Install Ollama buttons.
+4. **Skipped:** Ollama not installed.
+5. **Skipped:** no Anthropic key entered; cloud sharing left off.
+6. **Skipped:** needs a working provider; none was available.
+7. **Observed with the Search box only** (Library Search pane → Search, which
+   does not call a model). "Ask" was not tried because no provider was
+   available. Both searches logged
+   `Semantic retrieval failed: IndexedDB is not available in this context.`
+   (after `Library index built: 5 items`), so these results come from the
+   non-semantic fallback.
+   - Conceptual, "how does test loss improve as you spend more compute and
+     data on training": BERT, Attention, ResNet, GPT-3. **Not relevant:**
+     Scaling Laws for Neural Language Models, the obvious answer, was not
+     returned.
+   - By-author, "papers by Kaplan": Scaling Laws first, then GPT-3 (Jared
+     Kaplan is a co-author), then BERT and Attention as filler. **Relevant**
+     for the top two.
+8. **Skipped:** no OpenAI or Gemini key entered. **The Gemini Detect output
+   is still missing.**
+9. **Observed, passes.** The "Context size" section has two fields at 0. Set
+   to 50000 and 20000, clicked elsewhere, closed and reopened Settings: both
+   kept. Set back to 0: kept. (A triple-click did not select the existing "0"
+   in the second field, so it briefly read "020000" and saved as 20000.)
+10. **Skipped:** needs a provider; none was available.
+11. **Skipped:** Ollama not installed.
+12. **Skipped:** no Anthropic key entered.
+
+**New findings for §4** (not yet given defect numbers):
+
+- The embedding model never loads in Zotero 10.0.9: Transformers.js finds no
+  WASM backend because of `Dynamic require of "node:os"`. This confirms §3,
+  correction 3, at runtime.
+- The settings pane says "✓ Model ready" while the hashing fallback is in
+  use.
+- IndexedDB is unavailable in the plugin's context. This breaks both the
+  embedding-method migration and semantic retrieval for library search.
+- The provider dropdown label "OpenAI (GPT-4o-mini)" is stale.
+- The test count in §1 (304) is now 316.
 
 ### 7.2 M4 experiment 1 — can Zotero receive the sign-in callback?
 
@@ -821,7 +914,78 @@ The scripts were dry-run against mocked Zotero objects only. Whether
 `Zotero.Server` accepts a request from a browser, and whether a plugin may
 open a server socket, are exactly what is unknown.
 
-**Result:** not yet run.
+**Result (12 November 2026, same sitting and machine as §7.1): Route B
+works, Route A is refused by Zotero's server. M4 can go ahead on Route B.**
+
+How it was run: both scripts were run in Tools → Developer → Run JavaScript
+with "Run as async function" ticked. The start script printed "No setup
+problems." and both links; port 1455 was free. **The links were not opened in
+the owner's normal browser.** They were opened in the Chromium built into the
+Claude desktop app on the same Mac (user-agent `… Claude/5.1231.2
+Chrome/156.0.8078.75 Safari/537.36`). Safari has not been tried. Its
+user-agent also starts with `Mozilla/`, so Route A would be refused for it
+too (see below).
+
+- **Route A: refused.** Zotero's debug output for each
+  `GET /zotero-llm-assistant/auth/callback` reads `Preventing request from
+  browser`, then `Cancelling without sending a response`. The browser
+  retried about 0.6, 1, 2, 4 and 8 seconds later; each retry was refused the
+  same way. The "No endpoint found" text the browser displayed is the 404 for
+  `/favicon.ico`, not for the callback. Cause, from Zotero 10.0.9's
+  `chrome/content/zotero/xpcom/server/server.js` (`_processEndpoint`, in
+  `omni.ja`): any request whose user-agent starts with `Mozilla/`, or that
+  has an `Origin` header, is cancelled unless one of these holds:
+  - the endpoint sets `allowRequestsFromUnsafeWebContent`;
+  - the request has an `X-Zotero-Connector-API-Version` or
+    `Zotero-Allowed-Request` header;
+  - the path starts with `/test/`;
+  - it is a navigation to `/connector/ping`.
+
+  The experiment's endpoint sets none of these. Whether setting
+  `allowRequestsFromUnsafeWebContent` would make Route A work, and whether
+  that is acceptable, was not tested.
+- **Route B: received, all three values intact.** The first load showed a
+  browser error page (the exact error was not captured), but the listener
+  recorded the request. The second load rendered "Route B: Zotero received
+  this request." A `curl` to a different path (`/probe`) got the expected 404
+  and was not recorded. `lsof` showed Zotero listening on `127.0.0.1:1455`
+  only, and nothing was listening there after the report script ran.
+
+Output of `m4-callback-report.js`:
+
+```json
+{
+  "zoteroVersion": "10.0.9",
+  "routeA": {
+    "verdict": "NOT RECEIVED",
+    "port": 23119,
+    "path": "/zotero-llm-assistant/auth/callback",
+    "received": []
+  },
+  "routeB": {
+    "verdict": "RECEIVED, all three values intact",
+    "port": 1455,
+    "path": "/auth/callback",
+    "received": [
+      {
+        "pathname": "/auth/callback",
+        "query": { "code": "test-code", "state": "test-state", "client_id": "oaiapp_test" }
+      },
+      {
+        "pathname": "/auth/callback",
+        "query": { "code": "test-code", "state": "test-state", "client_id": "oaiapp_test" }
+      }
+    ]
+  },
+  "errors": []
+}
+```
+
+The `platform` key is missing because `Zotero.platform` is undefined in
+10.0.9. Before relying on Route B, it should be re-checked once in Safari.
+The first-load error page should also be explained: the listener reads the
+request only once (`reader.available()`) and closes the stream straight
+after writing the response.
 
 ---
 
